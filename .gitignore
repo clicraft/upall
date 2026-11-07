@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Real configs hold the secret ntfy topic: only the examples/ templates belong here.
+/ntfy.conf
+/secwatch.conf

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Install (or update) upall for the current user. Safe to run again: it only copies files that changed and
+# never overwrites your own configs.
+#
+#   ./install.sh               upall, its Python helpers, the secwatch unit (not enabled), example configs
+#   ./install.sh --secwatch    also enable and (re)start the upall-secwatch user service
+#
+# Root is never used here. The sudoers rule is prepared and checked in a temporary file; the command that
+# installs it is printed for you to run.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+BIN=$HOME/.local/bin
+LIB=$HOME/.local/lib/upall
+UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/upall
+secwatch=0
+for a in "$@"; do
+    case $a in
+        --secwatch) secwatch=1 ;;
+        -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $a" >&2; exit 2 ;;
+    esac
+done
+
+changed=()
+put() {  # put MODE SRC DEST: copy only if different
+    if ! cmp -s "$2" "$3" 2>/dev/null; then
+        install -D -m "$1" "$2" "$3"; changed+=("$3"); echo "installed $3"
+    fi
+}
+put_once() {  # put_once MODE SRC DEST: copy only if DEST doesn't exist (user configs)
+    if [[ -e $3 ]]; then echo "kept      $3 (yours; example in $2)"
+    else install -D -m "$1" "$2" "$3"; echo "installed $3 (from $2)"; fi
+}
+
+put 0755 bin/upall                 "$BIN/upall"
+put 0644 lib/upall/tui.py          "$LIB/tui.py"
+put 0644 lib/upall/pk_refresh.py   "$LIB/pk_refresh.py"
+put 0644 lib/upall/secwatch.py     "$LIB/secwatch.py"
+put 0644 systemd/upall-secwatch.service "$UNIT_DIR/upall-secwatch.service"
+put_once 0644 examples/topgrade.toml "${XDG_CONFIG_HOME:-$HOME/.config}/topgrade.toml"
+put_once 0644 examples/secwatch.conf "$CONF_DIR/secwatch.conf"
+((${#changed[@]})) || echo "upall files already up to date"
+
+# ntfy.conf holds a secret topic: never created from the placeholder, only explained.
+[[ -e $CONF_DIR/ntfy.conf ]] || echo "phone pushes: optional, see examples/ntfy.conf (copy to $CONF_DIR/ntfy.conf, chmod 600)"
+
+case ":$PATH:" in *":$BIN:"*) ;; *) echo "note: $BIN is not in your PATH" ;; esac
+
+# Dependencies: report what is missing, install nothing.
+missing=()
+for c in nala python3 topgrade notify-send nm-online; do command -v "$c" >/dev/null || missing+=("$c"); done
+python3 -c 'import rich' 2>/dev/null || missing+=("python3-rich")
+python3 -c 'import gi; gi.require_version("Flatpak", "1.0"); from gi.repository import Flatpak' 2>/dev/null \
+    || echo "optional: gir1.2-flatpak-1.0 (the TUI falls back to the flatpak CLI without it)"
+for c in flatpak snap timeshift fwupdmgr wezterm; do command -v "$c" >/dev/null || echo "optional: $c not found"; done
+((${#missing[@]})) && echo "MISSING: ${missing[*]}  (see README.md, Requirements)"
+
+# systemd user unit
+if command -v systemctl >/dev/null; then
+    systemctl --user daemon-reload
+    if ((secwatch)); then
+        systemctl --user enable upall-secwatch.service >/dev/null
+        systemctl --user restart upall-secwatch.service
+        echo "upall-secwatch enabled and (re)started: journalctl --user -u upall-secwatch -f"
+    elif systemctl --user is-active -q upall-secwatch.service \
+         && printf '%s\n' "${changed[@]}" | grep -q 'secwatch'; then
+        echo "upall-secwatch is running an older version: systemctl --user restart upall-secwatch"
+    fi
+fi
+
+# sudoers rule: prepare and check, the user installs it
+tmp=$(mktemp --suffix=.upall-sudoers)
+sed "s/@USER@/$(id -un)/g" sudoers/upall-nopasswd >"$tmp"
+if ! /usr/sbin/visudo -c -q -f "$tmp" >/dev/null 2>&1; then
+    echo "WARNING: visudo rejects the generated sudoers file ($tmp); not suggesting it"; exit 1
+fi
+# /etc/sudoers.d is root-only, so test what matters: do the commands already run without a password?
+if sudo -n nala --version >/dev/null 2>&1 && sudo -n apt-get --version >/dev/null 2>&1 \
+   && { ! command -v snap >/dev/null || sudo -n snap refresh --list >/dev/null 2>&1; }; then
+    echo "sudo: nala, apt-get and snap refresh already run without a password"
+    echo "  (to install this version of the rule anyway: sudo install -m 0440 -o root -g root $tmp /etc/sudoers.d/upall-nopasswd)"
+else
+    echo
+    echo "Passwordless rule for unattended runs (checked with visudo; read it first: $tmp):"
+    echo "  sudo install -m 0440 -o root -g root $tmp /etc/sudoers.d/upall-nopasswd"
+fi

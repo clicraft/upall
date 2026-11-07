@@ -1,0 +1,14 @@
+[Unit]
+Description=upall: check for Ubuntu security updates after login and after resume
+Documentation=https://github.com/clicraft/upall#security-alerts-upall-secwatch
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I %h/.local/lib/upall/secwatch.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=graphical-session.target

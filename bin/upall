@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# upall: check or update every package source on this machine.
+#
+#   upall check        list what is outdated (read-only, no password, sources queried in parallel)
+#   upall              update: apt (nala) + Flatpak + Snap in parallel, then topgrade for the rest
+#   upall --system     only the apt/Flatpak/Snap group
+#   upall --firmware   also apply firmware updates (fwupd) at the end
+#   upall --tui        same update, shown as a live table (speed, sizes, current package per source)
+#   upall --tui --demo preview the live table with fake jobs (changes nothing)
+#   upall --ask        always show the apt plan and ask before running it
+#
+# Safety: before apt, the plan is simulated. It asks (y/N) only when the plan removes packages or brings a
+# kernel that /boot may not hold; nothing to ask = nobody asked. A Timeshift snapshot is taken before apt
+# (last 3 kept). At the end PackageKit refreshes, so Discover and its tray icon see the new state.
+#
+# Logs: ~/.local/state/upall/<date-time>/<source>.log
+# Docs: https://github.com/clicraft/upall
+set -uo pipefail
+
+LOGROOT="${XDG_STATE_HOME:-$HOME/.local/state}/upall"
+APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+# Colours only on a terminal that has them; the spinner only on a terminal at all.
+TTY=0; [[ -t 1 ]] && TTY=1
+if ((TTY)) && (( $(tput colors 2>/dev/null || echo 0) >= 8 )); then
+    B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; D=$'\e[2m'; N=$'\e[0m'; SP=$'\e[1;36m'
+else B=; G=; R=; Y=; D=; N=; SP=; fi
+FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+say()  { printf '%s\n' "$*"; }
+head_() { printf '\n%s== %s ==%s\n' "$B" "$*" "$N"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+fmt_t() { printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
+
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------- spinner
+# Download speed for the spinner line: the whole machine's receive rate, from the interface counters in
+# /proc/net/dev (all interfaces except lo), in IEC units. Shown right-aligned only when the line has room.
+net_rx() { awk 'NR > 2 { sub(/:/, " "); if ($1 != "lo") s += $2 } END { printf "%d", s }' /proc/net/dev; }
+fmt_rate() {
+    LC_ALL=C awk -v b="$1" 'BEGIN { split("B KiB MiB GiB TiB", u, " "); i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        printf (i <= 2 ? "%.0f %s/s" : "%.1f %s/s"), b, u[i] }'
+}
+now_us() { local t=${EPOCHREALTIME/[.,]/}; echo "${t}"; }   # µs; the decimal sign depends on the locale
+RX_T=0 RX_LAST=0 RATE_TXT='' COLS=80
+spin_reset() { RX_T=0; RATE_TXT=''; COLS=$(tput cols 2>/dev/null || echo 80); }
+
+# spin_frame MSG START: one frame on the current line (braille wheel, message, elapsed, speed if room).
+SPIN_I=0
+spin_frame() {
+    local now rx left right pad
+    now=$(now_us)
+    if ((now - RX_T >= 500000)); then             # re-measure twice a second
+        rx=$(net_rx)
+        ((RX_T)) && RATE_TXT=$(fmt_rate $(( (rx - RX_LAST) * 1000000 / (now - RX_T) )))
+        RX_LAST=$rx RX_T=$now
+        COLS=$(tput cols 2>/dev/null || echo 80)
+    fi
+    left="${FRAMES[SPIN_I++ % ${#FRAMES[@]}]} $1 $(fmt_t $((SECONDS - $2)))"
+    right=${RATE_TXT:+↓ $RATE_TXT}
+    pad=$((COLS - ${#left} - ${#right} - 1))
+    if [[ -n $right ]] && ((pad >= 2)); then
+        printf '\r%s%s%s %s %s%s%s%*s%s%s%s\e[K' "$SP" "${left:0:1}" "$N" "$1" "$D" "$(fmt_t $((SECONDS - $2)))" "$N" \
+            "$pad" "" "$SP" "$right" "$N"
+    else
+        printf '\r%s%s%s %s %s%s%s\e[K' "$SP" "${left:0:1}" "$N" "$1" "$D" "$(fmt_t $((SECONDS - $2)))" "$N"
+    fi
+}
+spin_clear() { ((TTY)) && printf '\r\e[K'; }
+# spin MSG LOG CMD...: run CMD (output to LOG) with a spinner; returns CMD's exit code.
+# CMD runs in a subshell: its PID is ours even when CMD is sudo (kill -0 on a root PID fails).
+spin() {
+    local msg=$1 log=$2 start=$SECONDS pid rc; shift 2
+    ( "$@" ) >"$log" 2>&1 </dev/null &
+    pid=$!
+    if ((TTY)); then
+        spin_reset; tput civis 2>/dev/null
+        while kill -0 "$pid" 2>/dev/null; do spin_frame "$msg" "$start"; sleep 0.1; done
+        spin_clear; tput cnorm 2>/dev/null
+    fi
+    wait "$pid"; rc=$?
+    SPIN_T=$((SECONDS - start))
+    return $rc
+}
+
+# ---------------------------------------------------------------- check mode
+check_apt() {
+    sudo -n apt-get update -qq "${APT_OPTS[@]:0:2}" >/dev/null 2>&1 \
+        || say "(apt lists not refreshed: apt lock busy or no passwordless apt; showing cached state)"
+    # ⚠ marks updates from a *-security pocket (Ubuntu security fixes)
+    LC_ALL=C apt list --upgradable 2>/dev/null | tail -n +2 \
+        | awk -F'[/ ]' '{v=$3; o=$0; sub(/.*upgradable from: /,"",o); sub(/\]$/,"",o)
+                         m=($2 ~ /-security/) ? "⚠ " : "  "; printf "%s%-43s %s -> %s\n",m,$1,o,v}'
+}
+check_flatpak() {
+    LC_ALL=C flatpak remote-ls --updates --columns=application,version,branch 2>/dev/null \
+        | awk -F'\t' 'NF{printf "%-45s %s (%s)\n",$1,($2==""?"-":$2),$3}'
+}
+check_snap() {
+    LC_ALL=C snap refresh --list 2>&1 | awk 'NR>1 && NF{printf "%-45s -> %s\n",$1,$2}'
+}
+check_firmware() {
+    # exit 2 = nothing to do; uses the metadata fwupd-refresh.timer already downloaded
+    LC_ALL=C fwupdmgr get-updates --no-unreported-check --no-metadata-check --json 2>/dev/null \
+        | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit()
+for dev in d.get("Devices", []):
+    for r in dev.get("Releases", []):
+        print("%-45s %s -> %s" % (dev.get("Name", "?"), dev.get("Version", "?"), r.get("Version", "?")))
+'
+}
+check_rustup() {
+    LC_ALL=C rustup check 2>/dev/null | grep -i 'update available' \
+        | sed -E 's/ - [Uu]pdate available ?: / /; s/ \([0-9a-f]+ [0-9-]+\)//g' | awk '{printf "%-45s %s %s %s\n",$1,$2,$3,$4}'
+}
+check_npm() {
+    # --parseable: dir:wanted:current:latest  (each as name@version)
+    npm outdated -g --parseable 2>/dev/null | while IFS=: read -r _ _ current latest _; do
+        name=${latest%@*}; printf '%-45s %s -> %s\n' "$name" "${current##*@}" "${latest##*@}"
+    done
+}
+
+do_check() {
+    local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+    local src
+    declare -A label=([apt]="apt (.deb)" [flatpak]="Flatpak" [snap]="Snap" [firmware]="Firmware (fwupd)"
+                      [rustup]="Rust toolchain (rustup)" [npm]="npm global packages")
+    local order=(apt flatpak snap firmware rustup npm)
+    for src in "${order[@]}"; do
+        case $src in
+            flatpak) have flatpak || continue ;; snap) have snap || continue ;;
+            firmware) have fwupdmgr || continue ;; rustup) have rustup || continue ;; npm) have npm || continue ;;
+        esac
+        ( "check_$src" >"$tmp/$src" 2>&1 ) &
+    done
+    local start=$SECONDS
+    if ((TTY)); then
+        spin_reset; tput civis 2>/dev/null
+        while [[ -n $(jobs -rp) ]]; do spin_frame "Checking ${order[*]} in parallel…" "$start"; sleep 0.1; done
+        spin_clear; tput cnorm 2>/dev/null
+    fi
+    wait
+    say "${D}Checked in $(fmt_t $((SECONDS - start)))${N}"
+    local total=0 n
+    for src in "${order[@]}"; do
+        [[ -f $tmp/$src ]] || continue
+        n=$(grep -c . "$tmp/$src"; true)
+        [[ $src == apt ]] && n=$(grep -vc '^(apt lists' "$tmp/$src"; true)
+        total=$((total + n))
+        if ((n == 0)); then printf '%s✔%s %-26s up to date\n' "$G" "$N" "${label[$src]}"
+        else
+            local sec=0; [[ $src == apt ]] && sec=$(grep -c '^⚠' "$tmp/$src"; true)
+            head_ "${label[$src]}: $n$( ((sec)) && printf ' %s(%s security)%s' "$R" "$sec" "$N")"
+            cat "$tmp/$src"
+        fi
+    done
+    head_ "Not checked here"
+    say "pipx, uv tools, cargo, VS Code extensions, editor plugins, gh extensions, Claude Code, Codex,"
+    say "gcloud, SDKMAN, GHCup, Composer, Yazi… have no cheap read-only check; 'upall' updates them via topgrade."
+    say "Total outdated in the sources above: $total"
+}
+
+# ---------------------------------------------------------------- safety checks before apt
+KERNEL_MB=120        # one kernel + initramfs in /boot (~112 MB on Ubuntu 24.04); a 500 MB /boot holds two
+SNAP_TAG=upall-pre-apt
+SNAP_KEEP=3
+APT_SKIP=0 APT_WORK=0
+
+ask_yn() {  # ask_yn QUESTION: yes -> 0. Nobody at a terminal to answer = "no".
+    local a
+    ((TTY)) && [[ -r /dev/tty ]] || return 1
+    read -r -p "$1 " a </dev/tty || return 1
+    [[ $a == [yYsS]* ]]
+}
+
+apt_safety() {  # $1 = 1: always show the plan and ask (--ask)
+    local sim inst new remv kern boot_free nkern reasons=() r
+    sim=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 full-upgrade 2>/dev/null)
+    mapfile -t inst < <(awk '/^Inst /{print $2}' <<<"$sim")
+    mapfile -t new  < <(awk '/^Inst / && $3 !~ /^\[/{print $2}' <<<"$sim")
+    mapfile -t remv < <(awk '/^Remv /{print $2}' <<<"$sim")
+    mapfile -t kern < <(printf '%s\n' "${new[@]}" | grep -E '^linux-image-[0-9]')
+    APT_WORK=$(( ${#inst[@]} + ${#remv[@]} ))
+    boot_free=$(df --output=avail -m /boot | tail -1 | tr -d ' ')
+    nkern=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-[0-9]*' 2>/dev/null | grep -c '^ii ')
+    say "${D}apt plan: ${#inst[@]} to upgrade/install (${#new[@]} new), ${#remv[@]} to remove;" \
+        "/boot ${boot_free} MB free, ${nkern} kernel(s) installed${N}"
+    ((APT_WORK)) || return 0
+    # nala also auto-removes packages nobody needs any more; those are expected and not counted here.
+    ((${#remv[@]})) && reasons+=("the upgrade REMOVES ${#remv[@]} package(s): ${remv[*]}")
+    if ((${#kern[@]})); then
+        ((nkern >= 2)) && reasons+=("new kernel ${kern[*]} while ${nkern} are installed (/boot holds two)")
+        ((boot_free < KERNEL_MB * ${#kern[@]} + 30)) &&
+            reasons+=("new kernel needs ~$((KERNEL_MB * ${#kern[@]})) MB, /boot has ${boot_free} MB")
+    fi
+    ((${#reasons[@]} || $1)) || return 0
+    for r in "${reasons[@]}"; do say "${Y}! ${r}${N}"; done
+    say "${D}packages:${N}"; printf '%s\n' "${inst[@]}" | paste -sd' ' | fold -s -w 100 | sed 's/^/    /'
+    if ask_yn "${B}Run the apt upgrade?${N} [y/N]"; then return 0; fi
+    APT_SKIP=1; say "${Y}apt skipped${N} (Flatpak, Snap and tools still run)"
+}
+
+pre_apt_snapshot() {  # Timeshift snapshot of / right before apt; keeps the newest $SNAP_KEEP of ours
+    ((APT_WORK && !APT_SKIP)) || return 0
+    local name old s msg
+    if ! have timeshift; then   # other machines: no snapshot tool here, don't block on it
+        say "${D}no Timeshift on this system: apt runs without a snapshot${N}"; return 0
+    fi
+    if spin "Timeshift snapshot before apt…" "$RUN/snapshot.log" \
+            sudo -n timeshift --create --comments "$SNAP_TAG" --scripted; then
+        name=$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}' "$RUN/snapshot.log" | tail -1)
+        say "${G}✔${N} snapshot ${B}${name}${N} ${D}(roll back: Timeshift, or sudo timeshift --restore --snapshot ${name})${N}"
+        mapfile -t old < <(sudo -n timeshift --list --scripted 2>/dev/null \
+                             | awk -v t="$SNAP_TAG" '$2 == ">" && index($0, t) {print $3}' | head -n -"$SNAP_KEEP")
+        for s in "${old[@]}"; do
+            sudo -n timeshift --delete --snapshot "$s" --scripted --yes >/dev/null 2>&1 && say "${D}  pruned old snapshot $s${N}"
+        done
+    else
+        if grep -qiE 'password is required|contrasenya|a terminal is required' "$RUN/snapshot.log"; then
+            msg="timeshift isn't passwordless yet (install the updated /etc/sudoers.d/upall-nopasswd)"
+        else msg=$(tail -n 1 "$RUN/snapshot.log"); fi
+        say "${Y}! no snapshot: ${msg}${N}"
+        ask_yn "${B}Run apt without a snapshot?${N} [y/N]" || { APT_SKIP=1; say "${Y}apt skipped${N}"; }
+    fi
+}
+
+pk_refresh() {  # PackageKit cache refresh: Discover and its tray notifier rebuild their update lists
+    have python3 && [[ -f $PK ]] || return 0
+    if spin "Refreshing Discover's package cache (PackageKit)…" "$RUN/packagekit.log" python3 -I "$PK"; then
+        say "${G}✔${N} Discover / PackageKit refreshed ${D}in $(fmt_t "$SPIN_T")${N}"
+    else
+        say "${Y}! PackageKit refresh failed ($(tail -n 1 "$RUN/packagekit.log")); press 'Actualitza la llista' in Discover${N}"
+    fi
+}
+
+# ---------------------------------------------------------------- update mode
+SUDO_KEEPALIVE=
+cleanup() { [[ -n $SUDO_KEEPALIVE ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null; ((TTY)) && tput cnorm 2>/dev/null; }
+trap cleanup EXIT
+trap 'say ""; say "${Y}Ctrl-C: running package jobs are left to finish (interrupting dpkg is unsafe). Logs: ${RUN:-none}${N}"' INT
+
+run_job() {  # name, command... ; output goes to $RUN/name.log, exit code to $RUN/name.rc
+    local name=$1; shift
+    (
+        start=$SECONDS
+        "$@" >"$RUN/$name.log" 2>&1 </dev/null
+        rc=$?
+        echo "$rc $((SECONDS - start))" >"$RUN/$name.rc"
+        exit "$rc"
+    ) &
+    PIDS[$name]=$!
+}
+
+job_apt() {
+    if have nala; then
+        DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 sudo -n nala upgrade -y --no-update \
+            -o Nala::scrolling_text=false "${APT_OPTS[@]}"
+    else
+        DEBIAN_FRONTEND=noninteractive sudo -n apt-get -y "${APT_OPTS[@]}" full-upgrade &&
+            sudo -n apt-get -y autoremove
+    fi
+}
+job_flatpak() { LC_ALL=C.UTF-8 flatpak update -y --noninteractive; }
+job_snap()    { LC_ALL=C.UTF-8 sudo -n snap refresh; }
+
+summary_line() {  # name -> one line from the log worth showing
+    local log=$RUN/$1.log
+    case $1 in
+        apt)     grep -E -o '(Upgrade|Install|Auto-Remove|Remove) +[0-9]+ Packages?|Nothing to do|All packages are up to date' "$log" | paste -sd',' ;;
+        flatpak) grep -q 'Nothing to do' "$log" && echo 'nothing to do' || echo "updated: $(grep -c '^Updating' "$log")" ;;
+        snap)    tail -n 3 "$log" | paste -sd'; ' ;;
+    esac
+}
+
+wait_group() {  # report each job as it finishes; a spinner line names the ones still running
+    local name rc t left=${#PIDS[@]} start=$SECONDS running
+    ((TTY)) && { spin_reset; tput civis 2>/dev/null; }
+    while ((left > 0)); do
+        for name in "${!PIDS[@]}"; do
+            [[ -f $RUN/$name.rc && -z ${RESULT[$name]:-} ]] || continue
+            read -r rc t <"$RUN/$name.rc"; RESULT[$name]=$rc; left=$((left - 1))
+            spin_clear
+            if ((rc == 0)); then printf '%s✔ %-8s%s done in %s  %s%s%s\n' "$G" "$name" "$N" "$(fmt_t "$t")" "$D" "$(summary_line "$name")" "$N"
+            else printf '%s✘ %-8s%s failed (exit %s) after %s. Last lines of %s:\n' "$R" "$name" "$N" "$rc" "$(fmt_t "$t")" "$RUN/$name.log"
+                 tail -n 12 "$RUN/$name.log" | sed 's/^/    /'; fi
+        done
+        ((left > 0)) || break
+        if ((TTY)); then
+            running=()
+            for name in "${!PIDS[@]}"; do [[ -f $RUN/$name.rc ]] || running+=("$name"); done
+            spin_frame "running: ${running[*]}" "$start"; sleep 0.1
+        else
+            wait -n 2>/dev/null
+        fi
+    done
+    spin_clear; ((TTY)) && tput cnorm 2>/dev/null
+}
+
+do_update() {
+    local with_topgrade=$1 with_fw=$2 tui=$3 ask=$4
+    RUN="$LOGROOT/$(date +%Y%m%d-%H%M%S)"; mkdir -p "$RUN"
+    declare -gA PIDS=() RESULT=()
+
+    # With /etc/sudoers.d/upall-nopasswd nala and snap refresh need no password; otherwise ask once
+    # and keep the ticket alive. (`sudo -l` can't tell: it also lists commands that need a password.)
+    if spin "Checking sudo" /dev/null bash -c 'sudo -n nala --version && sudo -n snap refresh --list'; then
+        say "${D}sudo: nala and snap refresh are passwordless${N}"
+    else
+        head_ "sudo"
+        sudo -v || { say "${R}sudo needed for nala and snap.${N}"; exit 1; }
+        ( while :; do sudo -n -v 2>/dev/null; sleep 50; done ) & SUDO_KEEPALIVE=$!
+    fi
+
+    if spin "Refreshing apt lists…" "$RUN/apt-update.log" sudo -n apt-get update -q "${APT_OPTS[@]:0:2}"; then
+        say "${G}✔${N} apt lists refreshed ${D}in $(fmt_t "$SPIN_T")${N}"
+    else
+        say "${R}✘ apt-get update failed:${N}"; grep -E '^(E|W):' "$RUN/apt-update.log" | sed 's/^/    /'
+    fi
+
+    # If the upgrade includes snapd or flatpak themselves, don't update them while they're in use.
+    local serial=()
+    local upg; upg=$(LC_ALL=C apt list --upgradable 2>/dev/null | cut -d/ -f1)
+    grep -qx snapd <<<"$upg" && serial+=(snap)
+    grep -qxE 'flatpak|libflatpak0' <<<"$upg" && serial+=(flatpak)
+
+    apt_safety "$ask"
+    pre_apt_snapshot
+
+    if [[ $tui == 1 ]]; then
+        local targs=(--run "$RUN")
+        [[ $with_topgrade == 1 ]] || targs+=(--no-tools)
+        ((${#serial[@]})) && targs+=(--after-apt "$(IFS=,; echo "${serial[*]}")")
+        ((APT_SKIP)) && targs+=(--skip-apt)
+        python3 -I "$TUI" "${targs[@]}"; RESULT[tui]=$?
+        fw_and_summary "$with_fw"; return
+    fi
+
+    head_ "apt + Flatpak + Snap in parallel ${D}(logs: $RUN)${N}"
+    ((${#serial[@]})) && say "${Y}snapd/flatpak package itself is being upgraded: ${serial[*]} will run after apt.${N}"
+    ((APT_SKIP)) || run_job apt job_apt
+    have flatpak && [[ " ${serial[*]} " != *" flatpak "* ]] && run_job flatpak job_flatpak
+    have snap && [[ " ${serial[*]} " != *" snap "* ]] && run_job snap job_snap
+    say "${D}started: ${!PIDS[*]}${N}"
+    ((${#PIDS[@]})) && wait_group
+    if ((${#serial[@]})); then
+        PIDS=()
+        for s in "${serial[@]}"; do have "$s" && run_job "$s" "job_$s"; done
+        wait_group
+    fi
+
+    if [[ $with_topgrade == 1 ]]; then
+        head_ "topgrade (user-level tools, one after another)"
+        if have topgrade; then
+            topgrade --yes; RESULT[topgrade]=$?
+        else
+            say "${Y}topgrade not installed: uv tool install topgrade${N}"; RESULT[topgrade]=127
+        fi
+    fi
+    fw_and_summary "$with_fw"
+}
+
+fw_and_summary() {
+    local with_fw=$1
+    if have fwupdmgr; then
+        head_ "Firmware"
+        if [[ $with_fw == 1 ]]; then fwupdmgr refresh >/dev/null 2>&1; fwupdmgr update; RESULT[firmware]=$?
+        else
+            local fw fwlog; fwlog=$(mktemp)
+            spin "Checking firmware…" "$fwlog" check_firmware; fw=$(cat "$fwlog"); rm -f "$fwlog"
+            if [[ -n $fw ]]; then say "$fw"; say "${Y}Apply with: upall --firmware${N}"
+            else say "${G}✔${N} no firmware updates"; fi
+        fi
+    fi
+
+    # Phone push for applied security updates: upall-secwatch reads dpkg.log (covers Discover too).
+    pk_refresh
+
+    head_ "Summary"
+    local name bad=0
+    ((APT_SKIP)) && printf '%s-%s apt skipped\n' "$Y" "$N"
+    for name in apt flatpak snap topgrade tui firmware; do
+        [[ -n ${RESULT[$name]:-} ]] || continue
+        if ((RESULT[$name] == 0)); then printf '%s✔%s %s\n' "$G" "$N" "$name"
+        else printf '%s✘%s %s (exit %s)\n' "$R" "$N" "$name" "${RESULT[$name]}"; bad=1; fi
+    done
+    [[ -f /var/run/reboot-required ]] && say "${Y}Reboot required${N} ($(paste -sd' ' /var/run/reboot-required.pkgs 2>/dev/null))"
+    return $bad
+}
+
+# ---------------------------------------------------------------- main
+TUI="$HOME/.local/lib/upall/tui.py"
+PK="$HOME/.local/lib/upall/pk_refresh.py"
+topgrade_on=1 fw=0 mode=update tui=0 demo=0 ask=0
+# Sourced (tests): load the functions only.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+for a in "$@"; do
+    case $a in
+        check|-c|--check) mode=check ;;
+        --system|-s)      topgrade_on=0 ;;
+        --firmware|-f)    fw=1 ;;
+        --tui|-t)         tui=1 ;;
+        --demo)           demo=1 ;;
+        --ask|-a)         ask=1 ;;
+        -h|--help|help)   usage; exit 0 ;;
+        *) say "unknown option: $a"; usage; exit 2 ;;
+    esac
+done
+
+case $mode in
+    check)  do_check ;;
+    update) if ((demo)); then exec python3 -I "$TUI" --demo; fi
+            do_update "$topgrade_on" "$fw" "$tui" "$ask" ;;
+esac

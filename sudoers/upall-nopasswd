@@ -1,0 +1,26 @@
+# upall: the root commands upall and upall-secwatch run, without a password, so updates can run unattended.
+# install.sh replaces @USER@ with your user name, checks the result with visudo and prints the command that
+# installs it as /etc/sudoers.d/upall-nopasswd (mode 0440, root:root). See README.md, "The sudoers rule".
+#
+# nala and apt-get take any arguments. That is root-equivalent (both accept `-o` options that run commands):
+# anyone who can update your system can already do anything with it. Leave this file out if that is not OK
+# for you; upall then asks for your password once per run (and secwatch can't refresh or install).
+Cmnd_Alias UPALL_APT  = /usr/bin/nala, /usr/bin/apt-get
+# snap is pinned to `refresh`, optional --no-wait or --list, and plain snap names: no --channel, --devmode,
+# --classic or --amend.
+Cmnd_Alias UPALL_SNAP = /usr/bin/snap ^refresh( --no-wait| --list)?( [a-z0-9][a-z0-9-]*)*$
+# Timeshift, only the three exact calls upall makes: snapshot before apt (comment upall-pre-apt; no --tags:
+# timeshift 24.01 rejects "--tags O", O is the default), list, delete one snapshot by its timestamp name
+# (pruning upall's own; sudo can't check the comment, so any snapshot name is accepted: no more power than
+# nala/apt-get already have).
+Cmnd_Alias UPALL_TS   = /usr/bin/timeshift ^--create --comments upall-pre-apt --scripted$, \
+                        /usr/bin/timeshift ^--list --scripted$, \
+                        /usr/bin/timeshift ^--delete --snapshot [0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2} --scripted --yes$
+# The TUI reads the half-downloaded .debs (archives/partial is readable only by root/_apt) for its progress bar.
+Cmnd_Alias UPALL_LS   = /usr/bin/ls ^-ln /var/cache/apt/archives/partial$
+
+# Keep DEBIAN_FRONTEND (LC_* are kept by default) so apt runs non-interactively.
+Defaults!UPALL_APT env_keep += "DEBIAN_FRONTEND"
+
+@USER@ ALL=(root) NOPASSWD: UPALL_APT, UPALL_SNAP, UPALL_TS
+@USER@ ALL=(root) NOPASSWD:NOEXEC: UPALL_LS
