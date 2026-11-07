@@ -17,7 +17,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-24.04          # same ShellCheck (0.9.0) as Ubuntu 24.04 desktops
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: ShellCheck version
         run: shellcheck --version
       - name: Lint shell scripts
