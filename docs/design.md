@@ -11,7 +11,8 @@ lib/upall/tui.py          Python + rich: the --tui live view; runs the same jobs
 lib/upall/pk_refresh.py   Python + gi: one PackageKit RefreshCache over D-Bus
 lib/upall/secwatch.py     Python + gi: user service, login/resume checks, dpkg.log watcher, ntfy pushes
 systemd/                  the user unit for secwatch
-sudoers/                  passwordless rule template (@USER@)
+sbin/upall-root           bash, root-owned when installed: the only commands upall runs as root
+sudoers/                  passwordless rule template (@USER@): allows only sbin/upall-root
 examples/                 topgrade.toml, ntfy.conf, secwatch.conf
 ```
 
@@ -24,20 +25,23 @@ tests without running anything.
 
 ## Update flow
 
-1. **sudo probe**: `sudo -n nala --version && sudo -n snap refresh --list`. `sudo -l` can't be used: it lists
-   commands that need a password too. Without the rule: `sudo -v` once and a keepalive loop every 50 s.
-2. **apt lists**: `sudo -n apt-get update` behind a spinner.
+1. **sudo probe**: `sudo -n /usr/local/sbin/upall-root ping`. `sudo -l` can't be used: it lists commands that
+   need a password too. Without the rule: `sudo -v` once and a keepalive loop every 50 s, using the root-owned
+   helper if installed, else the copy in `~/.local/lib/upall`. The helper path is exported as `UPALL_ROOT` for the TUI.
+2. **apt lists**: `upall-root update` behind a spinner.
 3. **serial check**: if the upgrade contains `snapd` or `flatpak`/`libflatpak0`, that manager runs after apt.
 4. **apt_safety**: `apt-get -s -o Debug::NoLocking=1 full-upgrade`; parses `Inst`/`Remv` lines; counts
    new `linux-image-[0-9]*` packages against installed kernels and free space in `/boot`. The auto-removals
    come from python-apt, with the same calls nala makes (`Cache.upgrade(dist_upgrade=True)`, then every
    installed package that `is_auto_removable`); they count as apt work, so a run that only auto-removes still
    gets a snapshot.
-5. **pre_apt_snapshot**: Timeshift `--create --comments upall-pre-apt --scripted`, then prunes its own older
-   snapshots (`timeshift --list --scripted`, rows whose second field is `>`, filtered by the comment).
+5. **pre_apt_snapshot**: `upall-root ts-create` (Timeshift `--create --comments upall-pre-apt --scripted`), then
+   `upall-root ts-prune 3`: from `timeshift --list --scripted`, rows whose comment is *exactly* `upall-pre-apt`
+   (the tag letters are skipped), oldest first, all but the newest 3.
 6. **parallel group**: nala ‖ flatpak ‖ snap, each to `$RUN/<name>.log`, exit code and duration to
    `$RUN/<name>.rc`. `wait_group` polls the `.rc` files so each job is reported the moment it ends.
-7. **topgrade** `--yes` (skipped by `--system`).
+7. **topgrade** `--yes` (skipped by `--system`), after `upall-root home-snapshot` (read-only snapshot of `/home`,
+   which Timeshift doesn't cover) and `upall-root home-prune 3 14`.
 8. **firmware** check (`fwupdmgr get-updates --json`, using the metadata `fwupd-refresh.timer` already fetched),
    **PackageKit refresh**, **summary** with per-source exit codes and "Reboot required" if
    `/var/run/reboot-required` exists.
@@ -71,8 +75,8 @@ Each source reports through the most precise channel it has:
 
 | Source | Progress |
 |---|---|
-| apt | `apt-get --print-uris -qq full-upgrade` gives the .deb files and sizes nala will fetch. Progress = planned files already in `/var/cache/apt/archives` + sizes in `archives/partial` (root/_apt only: `sudo -n ls -ln`, once a second). Then `Setting up` lines in the log for the install phase. |
-| snap | `sudo snap refresh --no-wait` prints a change id; per-task byte progress from the snapd REST API on `/run/snapd.socket` (`/v2/changes/{id}`), readable as the user. |
+| apt | `apt-get --print-uris -qq full-upgrade` gives the .deb files and sizes nala will fetch. Progress = planned files already in `/var/cache/apt/archives` + sizes in `archives/partial` (root/_apt only: `upall-root apt-partial`, once a second). Then `Setting up` lines in the log for the install phase. |
+| snap | `upall-root snap-refresh --no-wait` prints a change id; per-task byte progress from the snapd REST API on `/run/snapd.socket` (`/v2/changes/{id}`), readable as the user. |
 | flatpak | runs in-process with libflatpak (`gi.repository.Flatpak` Transaction: `new-operation`, progress `changed`, `operation-done`/`operation-error`). Falls back to the `flatpak` CLI without byte progress if the bindings are missing. |
 | tools | topgrade's log: step headers (`―― HH:MM:SS - Step ――`) counted against a `topgrade -n` dry run. |
 
@@ -125,12 +129,26 @@ the connection that created it; `busctl` per call fails with "sender does not ma
 - **No reboot, anywhere.** Nothing calls `reboot`, `shutdown`, `systemctl reboot/poweroff/suspend`, or `kexec`;
   `unattended-upgrades` (which has an automatic-reboot option) isn't used.
 
-## Sudoers notes
+## Root helper and sudoers
 
-- Regex arguments (`^…$`) need sudo ≥ 1.9.10.
-- `env` must never be allowed in a NOPASSWD rule (it runs anything). `DEBIAN_FRONTEND` is passed with
-  `Defaults!UPALL_APT env_keep += "DEBIAN_FRONTEND"` instead.
-- Timeshift 24.01 rejects `--tags O` although `--help` lists it; O (on demand) is the default, so it is left out.
+The first version allowed `nala` and `apt-get` with any arguments, plus pinned `snap`, `timeshift`, `btrfs` and
+`ls` calls, and kept `DEBIAN_FRONTEND` through `env_keep`. A security audit found three problems with that: `nala`/
+`apt-get -o …` can run any command as root (passwordless root for any process running as the user); the Timeshift
+delete rule accepted any snapshot name (sudo can't check a comment); and an unchecked `DEBIAN_FRONTEND` lets a
+caller pick debconf's `Editor` frontend, a root editor if a package asks a question.
+
+`sbin/upall-root` replaces all of it. Rules it follows:
+- Fixed verbs; arguments are validated **before** the root check (exit 2), so CI tests them without root.
+  Exit codes: 0 ok, 1 failed, 2 usage, 3 precondition, 4 not root.
+- `PATH`, `LC_ALL`, `umask`, `DEBIAN_FRONTEND` are set by the script; sudo's `env_reset` drops the caller's.
+- Snapshot selection is done in pure functions (`ts_select`, `home_select`) covered by `upall-root selftest`.
+- `/home/.snapshots` must be a real directory owned by root and not group/other-writable (created that way on
+  first use), and each subvolume is checked (`inode 256`, not a symlink) before `btrfs subvolume delete`: nobody
+  can redirect a snapshot or a delete with a planted symlink.
+- Long actions `exec` the real command, so signals and exit codes pass through unchanged.
+
+Other notes: `env` must never be allowed in a NOPASSWD rule (it runs anything). Timeshift 24.01 rejects
+`--tags O` although `--help` lists it; O (on demand) is the default, so it is left out.
 
 ## Tested, and not yet
 

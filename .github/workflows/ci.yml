@@ -50,3 +50,26 @@ jobs:
           sudo --version | head -1
           sed "s/@USER@/$(id -un)/g" sudoers/upall-nopasswd > "$RUNNER_TEMP/upall-nopasswd"
           sudo visudo -c -f "$RUNNER_TEMP/upall-nopasswd"
+
+  root-helper:
+    name: upall-root checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Snapshot-selection selftest
+        run: sbin/upall-root selftest
+      - name: Rejects anything outside its fixed actions (exit 2), before needing root
+        run: |
+          bad=("" bogus "ts-prune" "ts-prune 0" "ts-prune 21" "ts-prune x" "ts-prune 3 4" "home-prune 3"
+               "home-prune 3 999" "snap-refresh --channel=edge" "snap-refresh --list x"
+               "update -o APT::Update::Pre-Invoke::=sh" "upgrade --purge" "ping now")
+          for a in "${bad[@]}"; do
+            set +e; sbin/upall-root $a >/dev/null 2>&1; rc=$?; set -e
+            echo "[$a] -> $rc"; [ "$rc" -eq 2 ] || exit 1
+          done
+      - name: Valid actions need root (exit 4) when run without sudo
+        run: |
+          for a in ping update upgrade "ts-prune 3" "home-prune 3 14" "snap-refresh --no-wait"; do
+            set +e; sbin/upall-root $a >/dev/null 2>&1; rc=$?; set -e
+            echo "[$a] -> $rc"; [ "$rc" -eq 4 ] || exit 1
+          done

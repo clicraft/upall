@@ -25,7 +25,8 @@ upall --tui          the same, as a live progress view
 - [Install](#install)
 - [Usage](#usage)
 - [Safety](#safety)
-- [The sudoers rule](#the-sudoers-rule)
+- [Restoring one tool](#restoring-one-tool)
+- [The root helper and the sudoers rule](#the-root-helper-and-the-sudoers-rule)
 - [Security alerts: upall-secwatch](#security-alerts-upall-secwatch)
 - [Files, logs and state](#files-logs-and-state)
 - [Tuning for another machine](#tuning-for-another-machine)
@@ -80,9 +81,10 @@ cd upall
 
 `install.sh` copies `upall` to `~/.local/bin`, the Python helpers to `~/.local/lib/upall`, the systemd user unit,
 and the example configs (only if you don't have them yet: `~/.config/topgrade.toml`, `~/.config/upall/secwatch.conf`).
-It lists missing dependencies, and prepares the sudoers rule: it fills in your user name, checks it with `visudo`
-and prints the command to install it. Run it again after `git pull`; it only copies what changed and tells you
-if the running service needs a restart.
+It lists missing dependencies, and prepares the root side: it runs the root helper's self-test, fills your user
+name into the sudoers rule, checks it with `visudo`, and prints the two `sudo install` commands for you to run.
+Run it again after `git pull`; it only copies what changed, tells you if the running service needs a restart, and
+prints the helper's install command again when the helper changed.
 
 Optional, once: `sudo nala fetch` to choose the fastest mirrors (pick 3 or so, in or near your country).
 
@@ -135,34 +137,73 @@ when something goes wrong:
    `snap revert`.
 5. **If snapd or flatpak themselves are in the apt upgrade**, those managers wait until apt is done.
 6. **Firmware is never applied unless you pass `--firmware`.**
-7. **No reboots.** No code path reboots, powers off, suspends or kexecs. "Reboot required" is only printed (plain
+7. **A read-only btrfs snapshot of `/home` is taken before topgrade.** The tools topgrade updates (rustup, pipx,
+   uv, npm, VS Code extensions…) live in your home folder, which Timeshift doesn't cover. Kept: the newest 3, none
+   older than 14 days. To undo one tool, copy its folder back: see [Restoring one tool](#restoring-one-tool).
+   Skipped when `/home` isn't its own btrfs subvolume; if the snapshot fails, topgrade runs anyway (each tool can
+   also be reinstalled at an older version).
+8. **No reboots.** No code path reboots, powers off, suspends or kexecs. "Reboot required" is only printed (plain
    mode, desktop notification, phone push).
 
-## The sudoers rule
+## Restoring one tool
 
-Without it, `upall` asks for your password once per run and keeps the sudo ticket alive while it works; secwatch
-then can't refresh the apt lists or install anything. With it, everything runs unattended.
-
-`sudoers/upall-nopasswd` allows, for your user only, without a password:
-
-- `nala` and `apt-get` with any arguments. This is **root-equivalent** (both accept `-o` options that run commands),
-  so only install it if updating the system without a password is acceptable on your machine.
-- `snap refresh`, optionally `--no-wait` or `--list` and snap names; nothing else (no `--channel`, `--devmode`,
-  `--classic`, `--amend`).
-- Timeshift, only the three exact calls upall makes: create the `upall-pre-apt` snapshot, list, delete one
-  snapshot by name. Restores and `--delete-all` still need your password.
-- `ls -ln /var/cache/apt/archives/partial` (no other arguments, `NOEXEC`), for the TUI's progress bar.
-
-`install.sh` prints the install command. By hand:
+Snapshots live in `/home/.snapshots/upall-pre-tools.<date>-<time>`, read-only, with your files' own permissions,
+so you can copy from them without root:
 
 ```bash
-sed "s/@USER@/$USER/" sudoers/upall-nopasswd > /tmp/upall-nopasswd
-visudo -c -f /tmp/upall-nopasswd          # must say "parsed OK"
-sudo install -m 0440 -o root -g root /tmp/upall-nopasswd /etc/sudoers.d/upall-nopasswd
+ls /home/.snapshots/                                        # pick the one taken before the bad update
+S=/home/.snapshots/upall-pre-tools.20261107-201754/$USER
+diff -rq "$S/.local/share/pipx/venvs/mkdocs" ~/.local/share/pipx/venvs/mkdocs   # what the update changed
+rsync -a --delete "$S/.local/share/pipx/venvs/mkdocs/" ~/.local/share/pipx/venvs/mkdocs/   # put it back
 ```
 
-`sudo -l` can't tell whether a rule is passwordless; upall checks by running harmless commands
-(`sudo -n nala --version`, `sudo -n snap refresh --list`).
+Common folders: `~/.rustup` and `~/.cargo/bin` (Rust), `~/.local/share/pipx` (pipx), `~/.local/share/uv/tools`
+(uv tools), `~/.vscode/extensions` (VS Code), `~/.sdkman/candidates` (SDKMAN), `~/.ghcup` (GHCup),
+`~/.npm-global/lib/node_modules` (npm, if that is your prefix).
+
+Don't roll back all of `/home`: that would also undo every document and setting changed since. Snapshots keep
+deleted files too, so a file you delete stays in the snapshots for up to 14 days. `du` on `/home` now counts the
+snapshots as well.
+
+## The root helper and the sudoers rule
+
+Every command upall runs as root goes through one small, root-owned script: **`upall-root`** (`sbin/upall-root`,
+installed as `/usr/local/sbin/upall-root`). It accepts a fixed list of actions and nothing else: no options, no
+paths, no environment from the caller.
+
+| Action | Runs as root |
+|---|---|
+| `ping`, `version` | nothing (checks that the helper is reachable) |
+| `update`, `update-quiet` | `apt-get update -q` / `-qq` |
+| `upgrade` | `nala upgrade --full -y --no-update` with upall's apt options (`apt-get full-upgrade` + `autoremove` without nala), `DEBIAN_FRONTEND=noninteractive` |
+| `snap-refresh [--no-wait\|--list]` | `snap refresh` |
+| `apt-partial` | `ls -ln /var/cache/apt/archives/partial` (TUI download progress) |
+| `ts-create`, `ts-prune KEEP` | Timeshift snapshot with the comment `upall-pre-apt`; delete those (only those) beyond the newest KEEP |
+| `home-snapshot`, `home-prune KEEP DAYS` | read-only btrfs snapshot of `/home` in `/home/.snapshots` (root-owned, created on first use); delete upall's own beyond KEEP or older than DAYS, never the newest |
+| `selftest` | checks the snapshot-selection logic (no root needed; also run in CI) |
+
+`sudoers/upall-nopasswd` lets **your user only** run that helper without a password. It does not allow apt, nala,
+snap, timeshift or btrfs directly, so a program running as you can't use the rule to run its own commands as
+root: the worst it can do is update the system from your configured repositories, or create and prune upall's
+own snapshots. Other Timeshift snapshots, restores and anything else still need your password.
+
+Without the rule (or without the root-owned helper), `upall` asks for your password once per run and keeps the
+ticket alive; secwatch then can't refresh the apt lists or install anything.
+
+`install.sh` prints the commands. By hand:
+
+```bash
+./sbin/upall-root selftest                                     # must print "selftest: ok"
+sed "s/@USER@/$USER/" sudoers/upall-nopasswd > /tmp/upall-nopasswd
+visudo -c -f /tmp/upall-nopasswd                               # must say "parsed OK"
+sudo install -m 0755 -o root -g root sbin/upall-root /usr/local/sbin/upall-root
+sudo install -m 0440 -o root -g root /tmp/upall-nopasswd /etc/sudoers.d/upall-nopasswd
+sudo -n /usr/local/sbin/upall-root ping                        # "ok", with no password prompt
+```
+
+The helper must stay root-owned in a root-owned folder: a copy anywhere you can write to would let anything running
+as you change what it does. After `git pull`, reinstall it when `install.sh` says it changed (upall also warns when
+the installed helper's version differs).
 
 ## Security alerts: upall-secwatch
 
@@ -228,14 +269,17 @@ python3 ~/.local/lib/upall/secwatch.py --push "Title" "Message" [tags]
 | `~/.local/state/upall/<date-time>/` | one run: `apt.log`, `flatpak.log`, `snap.log`, `apt-update.log`, `snapshot.log`, `packagekit.log`, and `topgrade.log` in TUI mode |
 | `~/.local/state/upall/secwatch-upall-*.log` | unattended runs started by secwatch |
 | `~/.local/state/upall/secwatch.json` | secwatch state: last check, last notified set, dpkg.log offset |
-| `/etc/sudoers.d/upall-nopasswd` | the passwordless rule |
+| `~/.local/lib/upall/upall-root` | copy of the root helper, used with your password when the root-owned one isn't installed |
+| `/usr/local/sbin/upall-root` | the root helper (root-owned) |
+| `/etc/sudoers.d/upall-nopasswd` | the passwordless rule (allows only the helper) |
+| `/home/.snapshots/upall-pre-tools.*` | read-only `/home` snapshots taken before topgrade |
 
 ## Tuning for another machine
 
 upall was written for one KDE neon desktop and keeps a few of its choices as constants near the top of each file:
 
-- `bin/upall`: `KERNEL_MB=120` (size of one kernel + initramfs in `/boot`), `SNAP_KEEP=3`, `SNAP_TAG`
-  (if you change it, change the sudoers rule too).
+- `bin/upall`: `KERNEL_MB=120` (size of one kernel + initramfs in `/boot`), `SNAP_KEEP=3` (Timeshift),
+  `TOOLS_KEEP=3` and `TOOLS_MAX_DAYS=14` (`/home` snapshots).
 - `lib/upall/secwatch.py`: `LOGIN_DELAY` (45 s; the network comes up ~30 s after login here), `RESUME_DELAY`,
   `MIN_INTERVAL`, `RENOTIFY`. Push titles start with the short host name.
 - The "Update now" button uses `wezterm`; replace it with `konsole -e` or your terminal.
@@ -247,7 +291,8 @@ upall was written for one KDE neon desktop and keeps a few of its choices as con
 |---|---|
 | `apt-get update failed` right after boot, "could not resolve" | DNS isn't up yet; run again in a minute. |
 | apt waits a long time at the start | Discover or PackageKit holds the apt lock; upall waits up to 5 min (`DPkg::Lock::Timeout=300`). |
-| "no snapshot: timeshift isn't passwordless yet" | Install or update the sudoers rule (`./install.sh` prints the command). |
+| "no snapshot: upall-root isn't passwordless yet" | Install the root helper and the sudoers rule (`./install.sh` prints the commands). |
+| "/usr/local/sbin/upall-root is version N, upall ships M" | The helper changed: rerun `./install.sh` and run the helper install command it prints. |
 | "apt skipped" with nobody asked | The plan was risky and there was no terminal to confirm. Run `upall --ask` yourself. |
 | Discover still lists updates you installed | Discover was open before; press "Refresh" once. upall refreshes PackageKit at the end of each run. |
 | A topgrade step fails | Plain mode prints topgrade's output; in the TUI see `topgrade.log` in the run's log folder. Disable the step in `~/.config/topgrade.toml` if it keeps failing. |
@@ -259,10 +304,11 @@ upall was written for one KDE neon desktop and keeps a few of its choices as con
 systemctl --user disable --now upall-secwatch
 rm -r ~/.local/bin/upall ~/.local/lib/upall ~/.config/systemd/user/upall-secwatch.service ~/.config/upall
 rm -rf ~/.local/state/upall
-sudo rm /etc/sudoers.d/upall-nopasswd
+sudo rm /etc/sudoers.d/upall-nopasswd /usr/local/sbin/upall-root
 ```
 
-Timeshift snapshots named `upall-pre-apt` stay until you delete them in Timeshift.
+Timeshift snapshots named `upall-pre-apt` stay until you delete them in Timeshift. `/home` snapshots: list them
+with `ls /home/.snapshots`, delete each with `sudo btrfs subvolume delete /home/.snapshots/upall-pre-tools.<…>`.
 
 ## License
 

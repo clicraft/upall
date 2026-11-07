@@ -11,14 +11,20 @@
 #
 # Safety: before apt, the plan is simulated. It asks (y/N) only when the plan removes packages or brings a
 # kernel that /boot may not hold; nothing to ask = nobody asked. A Timeshift snapshot is taken before apt
-# (last 3 kept). At the end PackageKit refreshes, so Discover and its tray icon see the new state.
+# (last 3 kept), and a read-only btrfs snapshot of /home before topgrade (user-level tools; last 3, max 14 days).
+# At the end PackageKit refreshes, so Discover and its tray icon see the new state.
 #
 # Logs: ~/.local/state/upall/<date-time>/<source>.log
 # Docs: https://github.com/clicraft/upall
 set -uo pipefail
 
 LOGROOT="${XDG_STATE_HOME:-$HOME/.local/state}/upall"
-APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+# Every root command goes through upall-root, which accepts fixed actions only (see sbin/upall-root).
+# Passwordless: the root-owned copy in /usr/local/sbin, allowed by /etc/sudoers.d/upall-nopasswd.
+# Without it: the copy installed with upall, run through sudo with your password.
+ROOT_SYS=/usr/local/sbin/upall-root
+ROOT_LOCAL="$HOME/.local/lib/upall/upall-root"
+ROOT=$ROOT_SYS
 
 # Colours only on a terminal that has them; the spinner only on a terminal at all.
 TTY=0; [[ -t 1 ]] && TTY=1
@@ -32,7 +38,7 @@ head_() { printf '\n%s== %s ==%s\n' "$B" "$*" "$N"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 fmt_t() { printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------- spinner
 # Download speed for the spinner line: the whole machine's receive rate, from the interface counters in
@@ -87,8 +93,8 @@ spin() {
 
 # ---------------------------------------------------------------- check mode
 check_apt() {
-    sudo -n apt-get update -qq "${APT_OPTS[@]:0:2}" >/dev/null 2>&1 \
-        || say "(apt lists not refreshed: apt lock busy or no passwordless apt; showing cached state)"
+    sudo -n "$ROOT_SYS" update-quiet >/dev/null 2>&1 \
+        || say "(apt lists not refreshed: apt lock busy or upall-root not passwordless; showing cached state)"
     # ⚠ marks updates from a *-security pocket (Ubuntu security fixes)
     LC_ALL=C apt list --upgradable 2>/dev/null | tail -n +2 \
         | awk -F'[/ ]' '{v=$3; o=$0; sub(/.*upgradable from: /,"",o); sub(/\]$/,"",o)
@@ -168,8 +174,7 @@ do_check() {
 
 # ---------------------------------------------------------------- safety checks before apt
 KERNEL_MB=120        # one kernel + initramfs in /boot (~112 MB on Ubuntu 24.04); a 500 MB /boot holds two
-SNAP_TAG=upall-pre-apt
-SNAP_KEEP=3
+SNAP_KEEP=3          # upall-pre-apt Timeshift snapshots kept (the comment is set by upall-root)
 APT_SKIP=0 APT_WORK=0
 
 ask_yn() {  # ask_yn QUESTION: yes -> 0. Nobody at a terminal to answer = "no".
@@ -224,25 +229,46 @@ apt_safety() {  # $1 = 1: always show the plan and ask (--ask)
 
 pre_apt_snapshot() {  # Timeshift snapshot of / right before apt; keeps the newest $SNAP_KEEP of ours
     ((APT_WORK && !APT_SKIP)) || return 0
-    local name old s msg
+    local name s msg
     if ! have timeshift; then   # other machines: no snapshot tool here, don't block on it
         say "${D}no Timeshift on this system: apt runs without a snapshot${N}"; return 0
     fi
-    if spin "Timeshift snapshot before apt…" "$RUN/snapshot.log" \
-            sudo -n timeshift --create --comments "$SNAP_TAG" --scripted; then
+    if spin "Timeshift snapshot before apt…" "$RUN/snapshot.log" sudo -n "$ROOT" ts-create; then
         name=$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}' "$RUN/snapshot.log" | tail -1)
         say "${G}✔${N} snapshot ${B}${name}${N} ${D}(roll back: Timeshift, or sudo timeshift --restore --snapshot ${name})${N}"
-        mapfile -t old < <(sudo -n timeshift --list --scripted 2>/dev/null \
-                             | awk -v t="$SNAP_TAG" '$2 == ">" && index($0, t) {print $3}' | head -n -"$SNAP_KEEP")
-        for s in "${old[@]}"; do
-            sudo -n timeshift --delete --snapshot "$s" --scripted --yes >/dev/null 2>&1 && say "${D}  pruned old snapshot $s${N}"
-        done
+        # upall-root deletes only snapshots whose comment is exactly upall-pre-apt, never the others
+        while read -r s; do say "${D}  pruned old snapshot $s${N}"; done < <(sudo -n "$ROOT" ts-prune "$SNAP_KEEP" 2>/dev/null)
     else
         if grep -qiE 'password is required|contrasenya|a terminal is required' "$RUN/snapshot.log"; then
-            msg="timeshift isn't passwordless yet (install the updated /etc/sudoers.d/upall-nopasswd)"
+            msg="upall-root isn't passwordless yet (see 'The sudoers rule' in the README)"
         else msg=$(tail -n 1 "$RUN/snapshot.log"); fi
         say "${Y}! no snapshot: ${msg}${N}"
         ask_yn "${B}Run apt without a snapshot?${N} [y/N]" || { APT_SKIP=1; say "${Y}apt skipped${N}"; }
+    fi
+}
+
+# Read-only btrfs snapshot of /home right before topgrade: the user-level tools it updates (rustup, pipx, uv,
+# npm, VS Code extensions…) all live in home folders, which Timeshift doesn't cover. Restore ONE tool by copying
+# its folder back (README, "Restoring one tool"); never roll back all of /home. Kept: newest $TOOLS_KEEP, none
+# older than $TOOLS_MAX_DAYS (@home churns: downloads, caches and deleted files stay pinned by a snapshot).
+# upall-root makes the snapshot in /home/.snapshots (root-owned, created on first use) and prunes only its own.
+TOOLS_KEEP=3
+TOOLS_MAX_DAYS=14
+
+pre_tools_snapshot() {
+    [[ $(stat -f -c %T /home 2>/dev/null) == btrfs && $(stat -c %i /home 2>/dev/null) == 256 ]] || {
+        say "${D}/home is not a btrfs subvolume: topgrade runs without a snapshot${N}"; return 0; }
+    local name msg s
+    if name=$(sudo -n "$ROOT" home-snapshot 2>"$RUN/home-snapshot.log"); then
+        say "${G}✔${N} /home snapshot ${B}${name##*/}${N} ${D}(restore one tool: see 'Restoring one tool' in the README)${N}"
+        while read -r s; do say "${D}  pruned old /home snapshot $s${N}"; done \
+            < <(sudo -n "$ROOT" home-prune "$TOOLS_KEEP" "$TOOLS_MAX_DAYS" 2>/dev/null)
+    else
+        if grep -qiE 'password is required|contrasenya|a terminal is required' "$RUN/home-snapshot.log"; then
+            msg="upall-root isn't passwordless yet (see 'The sudoers rule' in the README)"
+        else msg=$(tail -n 1 "$RUN/home-snapshot.log"); fi
+        # Tool updates are recoverable one by one (reinstall a version), so warn and go on instead of stopping.
+        say "${Y}! no /home snapshot: ${msg}; topgrade runs anyway${N}"
     fi
 }
 
@@ -273,19 +299,11 @@ run_job() {  # name, command... ; output goes to $RUN/name.log, exit code to $RU
     PIDS[$name]=$!
 }
 
-job_apt() {
-    if have nala; then
-        # --full: nala's default upgrade (full_upgrade = false) never installs new packages, so new kernels
-        # would be held back forever. apt_safety simulates exactly this full upgrade.
-        DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 sudo -n nala upgrade --full -y --no-update \
-            -o Nala::scrolling_text=false "${APT_OPTS[@]}"
-    else
-        DEBIAN_FRONTEND=noninteractive sudo -n apt-get -y "${APT_OPTS[@]}" full-upgrade &&
-            sudo -n apt-get -y autoremove
-    fi
-}
+# upgrade = `nala upgrade --full` (the full upgrade apt_safety simulated; nala's default would hold back new
+# kernels), or apt-get full-upgrade + autoremove without nala. Options and DEBIAN_FRONTEND are set by upall-root.
+job_apt()     { sudo -n "$ROOT" upgrade; }
 job_flatpak() { LC_ALL=C.UTF-8 flatpak update -y --noninteractive; }
-job_snap()    { LC_ALL=C.UTF-8 sudo -n snap refresh; }
+job_snap()    { sudo -n "$ROOT" snap-refresh; }
 
 summary_line() {  # name -> one line from the log worth showing
     local log=$RUN/$1.log
@@ -325,17 +343,24 @@ do_update() {
     RUN="$LOGROOT/$(date +%Y%m%d-%H%M%S)"; mkdir -p "$RUN"
     declare -gA PIDS=() RESULT=()
 
-    # With /etc/sudoers.d/upall-nopasswd nala and snap refresh need no password; otherwise ask once
+    # With upall-root installed and allowed in /etc/sudoers.d/upall-nopasswd, no password; otherwise ask once
     # and keep the ticket alive. (`sudo -l` can't tell: it also lists commands that need a password.)
-    if spin "Checking sudo" /dev/null bash -c 'sudo -n nala --version && sudo -n snap refresh --list'; then
-        say "${D}sudo: nala and snap refresh are passwordless${N}"
+    if spin "Checking sudo" /dev/null sudo -n "$ROOT_SYS" ping; then
+        say "${D}sudo: upall-root is passwordless${N}"
+        local v_sys v_local
+        v_sys=$("$ROOT_SYS" version 2>/dev/null) v_local=$("$ROOT_LOCAL" version 2>/dev/null)
+        [[ -z $v_local || $v_sys == "$v_local" ]] ||
+            say "${Y}! $ROOT_SYS is version $v_sys, upall ships $v_local: run install.sh and the command it prints${N}"
     else
         head_ "sudo"
-        sudo -v || { say "${R}sudo needed for nala and snap.${N}"; exit 1; }
+        [[ -x $ROOT_SYS ]] || ROOT=$ROOT_LOCAL
+        [[ -x $ROOT ]] || { say "${R}upall-root not found ($ROOT_SYS or $ROOT_LOCAL): run install.sh${N}"; exit 1; }
+        sudo -v || { say "${R}sudo is needed for apt, snap and the snapshots.${N}"; exit 1; }
         ( while :; do sudo -n -v 2>/dev/null; sleep 50; done ) & SUDO_KEEPALIVE=$!
     fi
+    export UPALL_ROOT=$ROOT    # the TUI uses the same helper
 
-    if spin "Refreshing apt lists…" "$RUN/apt-update.log" sudo -n apt-get update -q "${APT_OPTS[@]:0:2}"; then
+    if spin "Refreshing apt lists…" "$RUN/apt-update.log" sudo -n "$ROOT" update; then
         say "${G}✔${N} apt lists refreshed ${D}in $(fmt_t "$SPIN_T")${N}"
     else
         say "${R}✘ apt-get update failed:${N}"; grep -E '^(E|W):' "$RUN/apt-update.log" | sed 's/^/    /'
@@ -351,6 +376,7 @@ do_update() {
     pre_apt_snapshot
 
     if [[ $tui == 1 ]]; then
+        [[ $with_topgrade == 1 ]] && have topgrade && pre_tools_snapshot
         local targs=(--run "$RUN")
         [[ $with_topgrade == 1 ]] || targs+=(--no-tools)
         ((${#serial[@]})) && targs+=(--after-apt "$(IFS=,; echo "${serial[*]}")")
@@ -375,6 +401,7 @@ do_update() {
     if [[ $with_topgrade == 1 ]]; then
         head_ "topgrade (user-level tools, one after another)"
         if have topgrade; then
+            pre_tools_snapshot
             topgrade --yes; RESULT[topgrade]=$?
         else
             say "${Y}topgrade not installed: uv tool install topgrade${N}"; RESULT[topgrade]=127

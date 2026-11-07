@@ -5,7 +5,7 @@ Runs as a systemd user service in the Plasma session (~/.config/systemd/user/upa
   - after login: waits LOGIN_DELAY, then checks
   - after resume from sleep/hibernation: logind's PrepareForSleep(false) signal, waits RESUME_DELAY, then checks
   - no check if the last one was less than MIN_INTERVAL ago (several short naps = one check)
-The check: wait for the network, refresh apt lists (passwordless `sudo -n apt-get update`), list upgradable
+The check: wait for the network, refresh apt lists (passwordless `sudo -n upall-root update-quiet`), list upgradable
 packages from a *-security pocket. If there are any and AUTO_APPLY is on (default; AUTO_APPLY=0 in
 ~/.config/upall/secwatch.conf turns it off), `upall --system` installs them unattended, with all of upall's
 safety rules; the dpkg.log watcher below pushes "applied". If they are still pending after that (or AUTO_APPLY=0),
@@ -40,6 +40,7 @@ STATE = os.path.expanduser("~/.local/state/upall/secwatch.json")
 NTFY_CONF = os.path.expanduser("~/.config/upall/ntfy.conf")   # NTFY_URL=https://ntfy.sh/<random topic>; mode 600
 CONF = os.path.expanduser("~/.config/upall/secwatch.conf")    # AUTO_APPLY=0 turns automatic installing off
 UPALL = os.path.expanduser("~/.local/bin/upall")
+ROOT_HELPER = "/usr/local/sbin/upall-root"   # root-owned, passwordless through /etc/sudoers.d/upall-nopasswd
 RUNLOG_DIR = os.path.expanduser("~/.local/state/upall")
 DPKG_LOG = os.environ.get("SECWATCH_DPKG_LOG", "/var/log/dpkg.log")   # override for tests
 DPKG_POLL = 30            # s between size checks of dpkg.log
@@ -266,7 +267,7 @@ def check(reason, force=False):
             return
         log(f"{reason}: waiting for the network")
         subprocess.run(["nm-online", "-q", "-t", "120"])
-        r = subprocess.run(["sudo", "-n", "apt-get", "update", "-qq", "-o", "DPkg::Lock::Timeout=120"],
+        r = subprocess.run(["sudo", "-n", ROOT_HELPER, "update-quiet"],
                            capture_output=True, text=True, env=ENV_C)
         if r.returncode != 0:
             log(f"apt-get update failed ({r.returncode}): {(r.stderr or r.stdout).strip()[-200:]}; using cached lists")

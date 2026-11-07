@@ -1,0 +1,156 @@
+#!/bin/bash
+# upall-root: every command upall runs as root, and nothing else.
+#
+# Installed root-owned as /usr/local/sbin/upall-root; /etc/sudoers.d/upall-nopasswd lets one user run it
+# without a password. The caller chooses an action, never a command line: no free-form options, no paths, no
+# environment (sudo resets it; this script sets what it needs). That is what makes a passwordless rule safe.
+#
+#   ping                 is the helper reachable without a password? (prints "ok")
+#   version              helper version (no root needed)
+#   update               apt-get update            update-quiet   the same with -qq
+#   upgrade              nala upgrade --full -y --no-update (apt-get full-upgrade + autoremove without nala)
+#   snap-refresh [--no-wait|--list]
+#   apt-partial          ls -ln /var/cache/apt/archives/partial (TUI download progress)
+#   ts-create            Timeshift snapshot with the comment upall-pre-apt
+#   ts-prune KEEP        delete upall-pre-apt Timeshift snapshots except the newest KEEP (1-20); others untouched
+#   home-snapshot        read-only btrfs snapshot of /home in /home/.snapshots/upall-pre-tools.<time>
+#   home-prune KEEP DAYS delete upall-pre-tools snapshots beyond the newest KEEP or older than DAYS (never the newest)
+#   selftest             check the snapshot-selection logic on fixed examples (no root needed)
+#
+# Exit codes: 0 ok, 1 command failed, 2 bad usage, 3 precondition not met, 4 not root.
+set -euo pipefail
+umask 022
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C.UTF-8
+
+VERSION=1
+TS_TAG=upall-pre-apt
+HOME_DIR=/home
+HSNAP_DIR=/home/.snapshots
+HTAG=upall-pre-tools
+APT_LOCK=(-o DPkg::Lock::Timeout=300)
+CONF_OPTS=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+die() { local code=$1; shift; echo "upall-root: $*" >&2; exit "$code"; }
+usage() { echo "usage: upall-root ping|version|update|update-quiet|upgrade|snap-refresh [--no-wait|--list]|apt-partial|ts-create|ts-prune KEEP|home-snapshot|home-prune KEEP DAYS|selftest" >&2; exit 2; }
+int_in() { [[ $1 =~ ^[0-9]{1,3}$ ]] && ((10#$1 >= $2 && 10#$1 <= $3)); }
+
+# ---------------------------------------------------------------- selection (pure: stdin -> names to delete)
+# stdin: `timeshift --list --scripted`. A row is ours only if its comment is exactly upall-pre-apt.
+ts_select() {  # KEEP
+    awk -v tag="$TS_TAG" '
+        $2 == ">" && $3 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {
+            i = 4; while (i <= NF && $i ~ /^[OBHDWM]$/) i++          # skip the tag letters
+            c = ""; for (; i <= NF; i++) c = c (c == "" ? "" : " ") $i
+            if (c == tag) print $3 }' | sort | head -n -"$1"
+}
+# stdin: names in /home/.snapshots. Only upall-pre-tools.YYYYMMDD-HHMMSS; the newest is never selected.
+home_select() {  # KEEP CUTOFF(YYYYMMDD-HHMMSS)
+    local keep=$1 cutoff=$2 i n=()
+    mapfile -t n < <(grep -E "^$HTAG\.[0-9]{8}-[0-9]{6}\$" | sort)
+    for ((i = 0; i < ${#n[@]} - 1; i++)); do
+        if ((i < ${#n[@]} - keep)) || [[ ${n[i]#"$HTAG".} < "$cutoff" ]]; then echo "${n[i]}"; fi
+    done
+}
+
+selftest() {
+    local got want
+    got=$(ts_select 1 <<'EOF'
+Device : /dev/nvme0n1p6
+Num     Name                 Tags  Description
+------------------------------------------------------------------------------
+0    >  2026-10-27_10-30-57  O D W M  fresh after moving Docker out
+1    >  2026-11-03_11-00-02  W
+2    >  2026-11-07_13-37-00  O        upall-pre-apt
+3    >  2026-11-07_14-00-00  O        upall-pre-apt but not ours
+4    >  2026-11-07_15-00-00  O        not upall-pre-apt
+5    >  2026-11-07_17-55-37  O        upall-pre-apt
+6    >  2026-11-08_09-00-00  O        upall-pre-apt
+EOF
+)
+    want=$'2026-11-07_13-37-00\n2026-11-07_17-55-37'
+    [[ $got == "$want" ]] || { echo "selftest: ts_select keep 1: got [$got]" >&2; return 1; }
+    got=$(printf '%s\n' upall-pre-tools.20261001-000000 upall-pre-tools.20261105-120000 upall-pre-tools.20261106-120000 \
+            upall-pre-tools.20261107-120000 upall-pre-tools.20261107-130000 upall-pre-tools.2026 ../etc \
+            'upall-pre-tools.20261107-120000 x' other.20200101-000000 | home_select 3 20261024-000000)
+    want=$'upall-pre-tools.20261001-000000\nupall-pre-tools.20261105-120000'
+    [[ $got == "$want" ]] || { echo "selftest: home_select keep 3: got [$got]" >&2; return 1; }
+    got=$(printf '%s\n' upall-pre-tools.20200101-000000 | home_select 3 20261024-000000)
+    [[ -z $got ]] || { echo "selftest: the only snapshot must never be pruned: got [$got]" >&2; return 1; }
+    echo "selftest: ok"
+}
+
+# ---------------------------------------------------------------- /home checks
+home_ok() {
+    [[ $(stat -f -c %T "$HOME_DIR") == btrfs && $(stat -c %i "$HOME_DIR") == 256 ]] \
+        || die 3 "$HOME_DIR is not a btrfs subvolume"
+    [[ -e $HSNAP_DIR || -L $HSNAP_DIR ]] || install -d -m 0755 -o root -g root "$HSNAP_DIR"
+    # Root-owned and not writable by others: nobody can plant a symlink that redirects a snapshot or a delete.
+    [[ -d $HSNAP_DIR && ! -L $HSNAP_DIR ]] || die 3 "$HSNAP_DIR is not a plain directory"
+    local own mode
+    read -r own mode < <(stat -c '%u %a' "$HSNAP_DIR")
+    [[ $own == 0 ]] || die 3 "$HSNAP_DIR must be owned by root"
+    (((8#$mode & 8#022) == 0)) || die 3 "$HSNAP_DIR must not be writable by group or others"
+}
+
+# ---------------------------------------------------------------- main
+verb=${1:-}
+(($#)) && shift
+# 1. Arguments: checked before anything else (also without root, so CI can test them).
+case $verb in
+    ping|version|selftest|update|update-quiet|upgrade|apt-partial|ts-create|home-snapshot)
+        (($# == 0)) || usage ;;
+    snap-refresh)
+        (($# <= 1)) || usage
+        case ${1:-} in ""|--no-wait|--list) ;; *) usage ;; esac ;;
+    ts-prune)
+        if ! { (($# == 1)) && int_in "$1" 1 20; }; then usage; fi ;;
+    home-prune)
+        if ! { (($# == 2)) && int_in "$1" 1 20 && int_in "$2" 1 365; }; then usage; fi ;;
+    *) usage ;;
+esac
+case $verb in
+    version)  echo "$VERSION"; exit 0 ;;
+    selftest) selftest; exit ;;
+esac
+# 2. Root.
+((EUID == 0)) || die 4 "must run as root (sudo $0 $verb)"
+
+# 3. Act.
+case $verb in
+    ping)         echo ok ;;
+    update)       exec apt-get update -q "${APT_LOCK[@]}" ;;
+    update-quiet) exec apt-get update -qq "${APT_LOCK[@]}" ;;
+    upgrade)
+        export DEBIAN_FRONTEND=noninteractive
+        # --full: nala's default upgrade never installs new packages, so new kernels would be held back.
+        if command -v nala >/dev/null; then
+            exec nala upgrade --full -y --no-update -o Nala::scrolling_text=false "${APT_LOCK[@]}" "${CONF_OPTS[@]}"
+        fi
+        apt-get -y "${APT_LOCK[@]}" "${CONF_OPTS[@]}" full-upgrade
+        exec apt-get -y "${APT_LOCK[@]}" autoremove ;;
+    snap-refresh) exec snap refresh ${1:+"$1"} ;;
+    apt-partial)  exec ls -ln /var/cache/apt/archives/partial ;;
+    ts-create)
+        command -v timeshift >/dev/null || die 3 "timeshift is not installed"
+        exec timeshift --create --comments "$TS_TAG" --scripted ;;
+    ts-prune)
+        command -v timeshift >/dev/null || die 3 "timeshift is not installed"
+        timeshift --list --scripted | ts_select "$((10#$1))" | while read -r s; do
+            timeshift --delete --snapshot "$s" --scripted --yes >/dev/null && echo "$s"
+        done ;;
+    home-snapshot)
+        home_ok
+        name="$HSNAP_DIR/$HTAG.$(date +%Y%m%d-%H%M%S)"
+        [[ ! -e $name ]] || die 3 "$name already exists"
+        btrfs subvolume snapshot -r "$HOME_DIR" "$name" >/dev/null
+        echo "$name" ;;
+    home-prune)
+        home_ok
+        cutoff=$(date -d "-$((10#$2)) days" +%Y%m%d-%H%M%S)
+        find "$HSNAP_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' | home_select "$((10#$1))" "$cutoff" | while read -r s; do
+            p="$HSNAP_DIR/$s"
+            [[ -d $p && ! -L $p && $(stat -c %i "$p") == 256 ]] || continue   # a real subvolume, not a link
+            btrfs subvolume delete "$p" >/dev/null && echo "$s"
+        done ;;
+esac

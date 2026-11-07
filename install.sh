@@ -5,8 +5,8 @@
 #   ./install.sh               upall, its Python helpers, the secwatch unit (not enabled), example configs
 #   ./install.sh --secwatch    also enable and (re)start the upall-secwatch user service
 #
-# Root is never used here. The sudoers rule is prepared and checked in a temporary file; the command that
-# installs it is printed for you to run.
+# Root is never used here. The root helper (sbin/upall-root) and the sudoers rule that allows it are checked
+# here; the commands that install them as root are printed for you to run.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -38,6 +38,7 @@ put 0755 bin/upall                 "$BIN/upall"
 put 0644 lib/upall/tui.py          "$LIB/tui.py"
 put 0644 lib/upall/pk_refresh.py   "$LIB/pk_refresh.py"
 put 0644 lib/upall/secwatch.py     "$LIB/secwatch.py"
+put 0755 sbin/upall-root           "$LIB/upall-root"     # used with your password until the root-owned copy exists
 put 0644 systemd/upall-secwatch.service "$UNIT_DIR/upall-secwatch.service"
 put_once 0644 examples/topgrade.toml "${XDG_CONFIG_HOME:-$HOME/.config}/topgrade.toml"
 put_once 0644 examples/secwatch.conf "$CONF_DIR/secwatch.conf"
@@ -70,19 +71,24 @@ if command -v systemctl >/dev/null; then
     fi
 fi
 
-# sudoers rule: prepare and check, the user installs it
+# Root helper + sudoers rule: prepare and check; you install them.
+helper=$PWD/sbin/upall-root
+"$helper" selftest >/dev/null || { echo "WARNING: sbin/upall-root selftest failed; not suggesting it"; exit 1; }
 tmp=$(mktemp --suffix=.upall-sudoers)
 sed "s/@USER@/$(id -un)/g" sudoers/upall-nopasswd >"$tmp"
 if ! /usr/sbin/visudo -c -q -f "$tmp" >/dev/null 2>&1; then
     echo "WARNING: visudo rejects the generated sudoers file ($tmp); not suggesting it"; exit 1
 fi
-# /etc/sudoers.d is root-only, so test what matters: do the commands already run without a password?
-if sudo -n nala --version >/dev/null 2>&1 && sudo -n apt-get --version >/dev/null 2>&1 \
-   && { ! command -v snap >/dev/null || sudo -n snap refresh --list >/dev/null 2>&1; }; then
-    echo "sudo: nala, apt-get and snap refresh already run without a password"
-    echo "  (to install this version of the rule anyway: sudo install -m 0440 -o root -g root $tmp /etc/sudoers.d/upall-nopasswd)"
-else
+root_cmds=()
+cmp -s "$helper" /usr/local/sbin/upall-root ||
+    root_cmds+=("sudo install -m 0755 -o root -g root $helper /usr/local/sbin/upall-root")
+# /etc/sudoers.d is root-only, so test what matters: does the helper already run without a password?
+sudo -n /usr/local/sbin/upall-root ping >/dev/null 2>&1 ||
+    root_cmds+=("sudo install -m 0440 -o root -g root $tmp /etc/sudoers.d/upall-nopasswd")
+if ((${#root_cmds[@]})); then
     echo
-    echo "Passwordless rule for unattended runs (checked with visudo; read it first: $tmp):"
-    echo "  sudo install -m 0440 -o root -g root $tmp /etc/sudoers.d/upall-nopasswd"
+    echo "Root helper and passwordless rule for unattended runs (read them first: $helper, $tmp):"
+    printf '  %s\n' "${root_cmds[@]}"
+else
+    echo "upall-root: installed, up to date and passwordless"; rm -f "$tmp"
 fi

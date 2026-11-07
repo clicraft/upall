@@ -4,7 +4,7 @@
 Started by ~/.local/bin/upall after `sudo -v` and `apt-get update`. Each source reports through the
 most precise channel it has:
   apt      runs `nala upgrade`; progress = bytes of the planned .debs found in /var/cache/apt/archives
-           plus the size of archives/partial (read with passwordless `sudo -n ls -ln`, once a second), then dpkg lines in the log
+           plus the size of archives/partial (read through `upall-root apt-partial`, once a second), then dpkg lines in the log
   snap     starts `snap refresh --no-wait`, then reads per-task byte progress from the snapd REST API
   flatpak  runs the update in-process with libflatpak (gi), which reports bytes and status per operation
   tools    runs topgrade after the group; progress = steps seen / steps in a dry run
@@ -23,9 +23,9 @@ from rich.table import Table
 from rich.text import Text
 
 ARCHIVES = "/var/cache/apt/archives"
-APT_OPTS = ["-o", "DPkg::Lock::Timeout=300", "-o", "Dpkg::Options::=--force-confdef",
-            "-o", "Dpkg::Options::=--force-confold"]
 ENV_C = {**os.environ, "LC_ALL": "C.UTF-8"}
+# Every root command goes through upall-root (fixed actions only); upall passes the copy it checked.
+ROOT = os.environ.get("UPALL_ROOT", "/usr/local/sbin/upall-root")
 
 
 UNITS = ("B", "KiB", "MiB", "GiB", "TiB")   # IEC binary units, 1 KiB = 1024 B
@@ -143,8 +143,8 @@ def apt_plan():
     return files, inst
 
 
-def sudo_out(*cmd):
-    r = subprocess.run(["sudo", "-n", *cmd], capture_output=True, text=True)
+def root_out(*action):
+    r = subprocess.run(["sudo", "-n", ROOT, *action], capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else ""
 
 
@@ -158,8 +158,8 @@ def run_apt(job, rundir):
         return
     event(f"apt: {len(inst)} packages, {human(job.total)} to download")
     with open(f"{rundir}/apt.log", "w") as log:
-        cmd = ["sudo", "-n", "nala", "upgrade", "--full", "-y", "--no-update", "-o", "Nala::scrolling_text=false", *APT_OPTS]
-        p = popen(cmd, log, extra_env={"DEBIAN_FRONTEND": "noninteractive"})
+        # upall-root upgrade = nala upgrade --full -y --no-update with upall's apt options
+        p = popen(["sudo", "-n", ROOT, "upgrade"], log)
     job.start("downloading" if files else "installing")
     pending = dict(files)
     seen = set()
@@ -169,7 +169,7 @@ def run_apt(job, rundir):
                 del pending[f]
             # one sudo call per second (partial/ is _apt-only); `ls -ln` gives names and sizes
             partial = {}
-            for line in sudo_out("ls", "-ln", f"{ARCHIVES}/partial").splitlines():
+            for line in root_out("apt-partial").splitlines():
                 parts = line.split()
                 if len(parts) >= 9 and parts[-1].endswith(".deb") and parts[4].isdigit():
                     partial[parts[-1]] = int(parts[4])
@@ -238,7 +238,7 @@ def run_snap(job, rundir):
         return
     event("snap: " + ", ".join(f"{n} {v}" for n, v, _ in plan))
     with open(f"{rundir}/snap.log", "w") as log:
-        r = subprocess.run(["sudo", "-n", "snap", "refresh", "--no-wait"], env=ENV_C,
+        r = subprocess.run(["sudo", "-n", ROOT, "snap-refresh", "--no-wait"], env=ENV_C,
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, process_group=0)
         log.write(r.stdout + r.stderr)
     change = r.stdout.strip()
