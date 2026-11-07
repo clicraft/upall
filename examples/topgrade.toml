@@ -8,7 +8,7 @@
 # - firmware: upall only checks it; `upall --firmware` applies it.
 # - containers: would `docker pull` every local image, including local builds that exist on no registry.
 # - android_studio: runs `/snap/bin/android-studio update`, which starts the IDE.
-# - self_update: topgrade is installed with `uv tool`; uv updates it (see [commands]).
+# - self_update: topgrade is installed with `uv tool`; topgrade's uv step updates it (`uv tool upgrade --all`).
 # - node: `npm update -g` fails because ~/.npmrc has bin-links=false and yo's postinstall runs `yodoctor`
 #   through a bin link; replaced by the custom command below with --ignore-scripts.
 disable = ["system", "snap", "flatpak", "firmware", "containers", "android_studio", "self_update", "node"]
@@ -18,8 +18,5 @@ no_retry = true
 notify_end = "never"
 
 [commands]
-# topgrade's uv step only runs `uv self update`; this updates the tools installed with uv
-# (markitdown, google-colab-cli, topgrade itself).
-"uv tools" = "uv tool upgrade --all"
 # npm globals (gemini-cli, marp-cli, generator-code, yo) without install scripts, see [misc] disable.
 "npm globals" = "npm update -g --ignore-scripts"
