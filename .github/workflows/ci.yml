@@ -26,3 +26,27 @@ jobs:
           mapfile -t scripts < <(git ls-files | xargs grep -lE '^#!.*\b(ba)?sh\b' --)
           printf 'checking: %s\n' "${scripts[@]}"
           shellcheck --format=gcc "${scripts[@]}"
+
+  python:
+    name: python syntax
+    runs-on: ubuntu-24.04          # system Python 3.12, as on Ubuntu 24.04 desktops
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compile every Python file
+        run: |
+          python3 --version
+          mapfile -t files < <(git ls-files '*.py')
+          printf 'checking: %s\n' "${files[@]}"
+          python3 -m py_compile "${files[@]}"
+
+  sudoers:
+    name: visudo
+    runs-on: ubuntu-24.04          # sudo 1.9.15: regex arguments (^…$) need 1.9.10 or later
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the sudoers template
+        # the same substitution install.sh makes, then sudo's own parser
+        run: |
+          sudo --version | head -1
+          sed "s/@USER@/$(id -un)/g" sudoers/upall-nopasswd > "$RUNNER_TEMP/upall-nopasswd"
+          sudo visudo -c -f "$RUNNER_TEMP/upall-nopasswd"
