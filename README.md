@@ -1,5 +1,8 @@
 # upall
 
+[![CI](https://img.shields.io/github/actions/workflow/status/clicraft/upall/ci.yml?label=CI&style=flat-square)](https://github.com/clicraft/upall/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/clicraft/upall?style=flat-square)](LICENSE)
+
 One command to check and update every package source on an Ubuntu-based desktop (built on KDE neon 24.04):
 **apt** (through nala), **Flatpak** and **Snap** in parallel, then **topgrade** for user-level tools (rustup,
 pipx, uv tools, npm globals, VS Code extensions, gh extensions…). Firmware updates are checked and only applied

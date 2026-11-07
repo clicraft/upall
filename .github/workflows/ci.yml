@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04          # same ShellCheck (0.9.0) as Ubuntu 24.04 desktops
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck version
+        run: shellcheck --version
+      - name: Lint shell scripts
+        # bin/upall has no .sh extension, so list the scripts by their shebang
+        run: |
+          mapfile -t scripts < <(git ls-files | xargs grep -lE '^#!.*\b(ba)?sh\b' --)
+          printf 'checking: %s\n' "${scripts[@]}"
+          shellcheck --format=gcc "${scripts[@]}"
