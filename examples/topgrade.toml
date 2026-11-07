@@ -9,9 +9,11 @@
 # - containers: would `docker pull` every local image, including local builds that exist on no registry.
 # - android_studio: runs `/snap/bin/android-studio update`, which starts the IDE.
 # - self_update: topgrade is installed with `uv tool`; topgrade's uv step updates it (`uv tool upgrade --all`).
+# - github_cli_skills: `gh skill update` only manages skills installed with `gh skill install`; skills
+#   installed by their own tool (graphify) or written by hand only produce "no GitHub metadata" notices.
 # - node: `npm update -g` fails because ~/.npmrc has bin-links=false and yo's postinstall runs `yodoctor`
 #   through a bin link; replaced by the custom command below with --ignore-scripts.
-disable = ["system", "snap", "flatpak", "firmware", "containers", "android_studio", "self_update", "node"]
+disable = ["system", "snap", "flatpak", "firmware", "containers", "android_studio", "self_update", "node", "github_cli_skills"]
 
 # Don't stop to ask "retry?" when a step fails; upall shows the failures in the summary.
 no_retry = true
