@@ -29,7 +29,10 @@ tests without running anything.
 2. **apt lists**: `sudo -n apt-get update` behind a spinner.
 3. **serial check**: if the upgrade contains `snapd` or `flatpak`/`libflatpak0`, that manager runs after apt.
 4. **apt_safety**: `apt-get -s -o Debug::NoLocking=1 full-upgrade`; parses `Inst`/`Remv` lines; counts
-   new `linux-image-[0-9]*` packages against installed kernels and free space in `/boot`.
+   new `linux-image-[0-9]*` packages against installed kernels and free space in `/boot`. The auto-removals
+   come from python-apt, with the same calls nala makes (`Cache.upgrade(dist_upgrade=True)`, then every
+   installed package that `is_auto_removable`); they count as apt work, so a run that only auto-removes still
+   gets a snapshot.
 5. **pre_apt_snapshot**: Timeshift `--create --comments upall-pre-apt --scripted`, then prunes its own older
    snapshots (`timeshift --list --scripted`, rows whose second field is `>`, filtered by the comment).
 6. **parallel group**: nala ‖ flatpak ‖ snap, each to `$RUN/<name>.log`, exit code and duration to
@@ -38,6 +41,11 @@ tests without running anything.
 8. **firmware** check (`fwupdmgr get-updates --json`, using the metadata `fwupd-refresh.timer` already fetched),
    **PackageKit refresh**, **summary** with per-source exit codes and "Reboot required" if
    `/var/run/reboot-required` exists.
+
+nala runs as `nala upgrade --full`. Without `--full`, nala follows `full_upgrade = false` in
+`/etc/nala/nala.conf` (its default), which is `apt-get upgrade`: no new packages and no removals, so a new kernel
+(a new `linux-image-*` package pulled in by `linux-generic`) is held back forever, and the safety check would
+be judging a plan that never runs. The flag keeps the setting local to upall; interactive `nala` is unchanged.
 
 apt options everywhere: `DPkg::Lock::Timeout=300` (Discover/packagekitd often hold the lock for a while),
 `--force-confdef --force-confold`, `DEBIAN_FRONTEND=noninteractive`. nala runs with `--no-update` (lists were

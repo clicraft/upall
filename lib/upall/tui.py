@@ -158,7 +158,7 @@ def run_apt(job, rundir):
         return
     event(f"apt: {len(inst)} packages, {human(job.total)} to download")
     with open(f"{rundir}/apt.log", "w") as log:
-        cmd = ["sudo", "-n", "nala", "upgrade", "-y", "--no-update", "-o", "Nala::scrolling_text=false", *APT_OPTS]
+        cmd = ["sudo", "-n", "nala", "upgrade", "--full", "-y", "--no-update", "-o", "Nala::scrolling_text=false", *APT_OPTS]
         p = popen(cmd, log, extra_env={"DEBIAN_FRONTEND": "noninteractive"})
     job.start("downloading" if files else "installing")
     pending = dict(files)

@@ -95,7 +95,7 @@ Optional, once: `sudo nala fetch` to choose the fastest mirrors (pick 3 or so, i
 | `upall --system`, `-s` | Only apt + Flatpak + Snap (no topgrade). This is what secwatch runs. |
 | `upall --tui`, `-t` | The update as a live table. Combine with `--system`. |
 | `upall --tui --demo` | Preview the table with fake jobs; changes nothing. |
-| `upall --ask`, `-a` | Always show the apt plan and ask before running it. |
+| `upall --ask`, `-a` | Always show the apt plan (upgrades, new packages, removals, auto-removals) and ask before running it. |
 | `upall --firmware`, `-f` | Also apply firmware updates with `fwupdmgr update` (it asks before any reboot). |
 | `upall --help` | Short help. |
 
@@ -103,7 +103,7 @@ Typical update run (plain mode):
 
 ```
 ✔ apt lists refreshed in 0m04s
-apt plan: 12 to upgrade/install (0 new), 0 to remove; /boot 268 MB free, 2 kernel(s) installed
+apt plan: 12 to upgrade/install (0 new), 0 to remove, 0 to auto-remove; /boot 268 MB free, 2 kernel(s) installed
 ✔ snapshot 2026-11-07_13-37-00 (roll back: Timeshift, or sudo timeshift --restore --snapshot 2026-11-07_13-37-00)
 
 == apt + Flatpak + Snap in parallel (logs: ~/.local/state/upall/20261107-133701) ==
@@ -123,7 +123,10 @@ when something goes wrong:
 1. **The apt plan is simulated first** (`apt-get -s full-upgrade`). upall asks `[y/N]` only if the plan
    **removes** packages, or brings a **new kernel** while two are installed or `/boot` is short of space. With
    nobody at the terminal to answer (secwatch, cron), the answer is "no": apt is skipped and the rest still runs.
-   nala's autoremove of packages nothing needs any more is expected and doesn't count as a removal.
+   The packages nala will **auto-remove** afterwards (nothing needs them any more, mostly old kernels) are listed
+   on every run, in the `apt plan:` line, but are expected and not a reason to ask. `--ask` shows the whole plan.
+   apt runs as a **full upgrade** (`nala upgrade --full`), the same plan that was simulated: nala's own default
+   holds back anything that needs a new package, which includes every new kernel.
 2. **A Timeshift snapshot is taken before apt** (comment `upall-pre-apt`); the newest 3 of upall's own are kept,
    Timeshift's scheduled snapshots are left alone. If the snapshot fails, upall asks whether to go on without one
    (no terminal: apt is skipped). No Timeshift installed: a note, and apt runs without a snapshot.

@@ -179,20 +179,34 @@ ask_yn() {  # ask_yn QUESTION: yes -> 0. Nobody at a terminal to answer = "no".
     [[ $a == [yYsS]* ]]
 }
 
+# Packages nala's autoremove would take out after the upgrade: the same python-apt calls nala makes
+# (full upgrade, then is_auto_removable). No root, nothing changed. Empty if python3-apt is missing.
+auto_removals() {
+    python3 -I -c '
+import apt
+c = apt.Cache()
+c.upgrade(dist_upgrade=True)
+print("\n".join(sorted(p.name for p in c if p.is_installed and not p.marked_delete and p.is_auto_removable)))
+' 2>/dev/null
+}
+
 apt_safety() {  # $1 = 1: always show the plan and ask (--ask)
-    local sim inst new remv kern boot_free nkern reasons=() r
+    local sim inst new remv auto kern boot_free nkern reasons=() r
     sim=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 full-upgrade 2>/dev/null)
     mapfile -t inst < <(awk '/^Inst /{print $2}' <<<"$sim")
     mapfile -t new  < <(awk '/^Inst / && $3 !~ /^\[/{print $2}' <<<"$sim")
     mapfile -t remv < <(awk '/^Remv /{print $2}' <<<"$sim")
+    mapfile -t auto < <(auto_removals | grep .)   # grep: no empty line = no phantom package
     mapfile -t kern < <(printf '%s\n' "${new[@]}" | grep -E '^linux-image-[0-9]')
-    APT_WORK=$(( ${#inst[@]} + ${#remv[@]} ))
+    # nala removes the auto-removable packages even when nothing is upgraded: that counts as work (snapshot).
+    APT_WORK=$(( ${#inst[@]} + ${#remv[@]} + ${#auto[@]} ))
     boot_free=$(df --output=avail -m /boot | tail -1 | tr -d ' ')
     nkern=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-[0-9]*' 2>/dev/null | grep -c '^ii ')
-    say "${D}apt plan: ${#inst[@]} to upgrade/install (${#new[@]} new), ${#remv[@]} to remove;" \
+    say "${D}apt plan: ${#inst[@]} to upgrade/install (${#new[@]} new), ${#remv[@]} to remove," \
+        "${#auto[@]} to auto-remove${auto[*]:+ (${auto[*]})};" \
         "/boot ${boot_free} MB free, ${nkern} kernel(s) installed${N}"
     ((APT_WORK)) || return 0
-    # nala also auto-removes packages nobody needs any more; those are expected and not counted here.
+    # Auto-removals (packages nothing needs any more, mostly old kernels) are expected: shown, not a reason to ask.
     ((${#remv[@]})) && reasons+=("the upgrade REMOVES ${#remv[@]} package(s): ${remv[*]}")
     if ((${#kern[@]})); then
         ((nkern >= 2)) && reasons+=("new kernel ${kern[*]} while ${nkern} are installed (/boot holds two)")
@@ -201,7 +215,9 @@ apt_safety() {  # $1 = 1: always show the plan and ask (--ask)
     fi
     ((${#reasons[@]} || $1)) || return 0
     for r in "${reasons[@]}"; do say "${Y}! ${r}${N}"; done
-    say "${D}packages:${N}"; printf '%s\n' "${inst[@]}" | paste -sd' ' | fold -s -w 100 | sed 's/^/    /'
+    if ((${#inst[@]})); then
+        say "${D}packages:${N}"; printf '%s\n' "${inst[@]}" | paste -sd' ' | fold -s -w 100 | sed 's/^/    /'
+    fi
     if ask_yn "${B}Run the apt upgrade?${N} [y/N]"; then return 0; fi
     APT_SKIP=1; say "${Y}apt skipped${N} (Flatpak, Snap and tools still run)"
 }
@@ -259,7 +275,9 @@ run_job() {  # name, command... ; output goes to $RUN/name.log, exit code to $RU
 
 job_apt() {
     if have nala; then
-        DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 sudo -n nala upgrade -y --no-update \
+        # --full: nala's default upgrade (full_upgrade = false) never installs new packages, so new kernels
+        # would be held back forever. apt_safety simulates exactly this full upgrade.
+        DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 sudo -n nala upgrade --full -y --no-update \
             -o Nala::scrolling_text=false "${APT_OPTS[@]}"
     else
         DEBIAN_FRONTEND=noninteractive sudo -n apt-get -y "${APT_OPTS[@]}" full-upgrade &&
