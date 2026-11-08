@@ -39,7 +39,7 @@ How it works inside, and why it is built this way: [docs/design.md](docs/design.
 
 - **Parallel**: nala, Flatpak and Snap use separate locks, so they download and install at the same time. nala
   itself downloads in parallel from several mirrors (`sudo nala fetch` picks the fastest ones).
-- **One check for everything**: `upall check` queries apt, Flatpak, Snap, fwupd, rustup and npm in parallel and
+- **One check for everything**: `upall check` queries apt, Flatpak, Snap, fwupd, rustup, npm and AutoFirma in parallel and
   prints one list; apt security fixes are marked `⚠` and counted.
 - **Live TUI** (`--tui`): one row per source with a nala-style bar, percentage, bytes, speed and the current
   package. The layout adapts to the terminal width (full, compact, three-line, spinner-only) and follows resizes.
@@ -93,7 +93,7 @@ Optional, once: `sudo nala fetch` to choose the fastest mirrors (pick 3 or so, i
 
 | Command | What it does |
 |---|---|
-| `upall check` | List what is outdated in apt, Flatpak, Snap, firmware, rustup and npm. Read-only. |
+| `upall check` | List what is outdated in apt, Flatpak, Snap, firmware, rustup, npm and AutoFirma. Read-only. |
 | `upall` | Update: apt + Flatpak + Snap in parallel, then topgrade, then a firmware check. |
 | `upall --system`, `-s` | Only apt + Flatpak + Snap (no topgrade). |
 | `upall --security` | Only apt's **security** updates (packages whose new version is in a `*-security` pocket, plus what they need): no other upgrades, no autoremove, no Flatpak/Snap/tools. This is what secwatch runs unattended. Not with `--tui`. |
