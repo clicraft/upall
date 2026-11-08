@@ -22,7 +22,8 @@ no_retry = true
 notify_end = "never"
 
 [commands]
-# npm globals (gemini-cli, marp-cli, generator-code, yo) without install scripts, see [misc] disable.
-"npm globals" = "npm update -g --ignore-scripts"
+# npm globals without install scripts (see [misc] disable). --loglevel=error: hide "npm warn deprecated" lines
+# about packages deep inside the tools' own dependencies (only their authors can fix those); errors still show.
+"npm globals" = "npm update -g --ignore-scripts --loglevel=error --no-fund"
 # VS Code extensions, as topgrade's own step, without the DEP0169 warning from VS Code's CLI (see [misc] disable).
 "Visual Studio Code extensions" = "command -v code >/dev/null || exit 0; NODE_OPTIONS=--no-deprecation code --update-extensions"
