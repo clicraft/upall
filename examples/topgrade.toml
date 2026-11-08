@@ -9,11 +9,13 @@
 # - containers: would `docker pull` every local image, including local builds that exist on no registry.
 # - android_studio: runs `/snap/bin/android-studio update`, which starts the IDE.
 # - self_update: topgrade is installed with `uv tool`; topgrade's uv step updates it (`uv tool upgrade --all`).
+# - vscode: replaced by the custom command below, the same `code --update-extensions` with Node's
+#   deprecation warnings off (VS Code's own CLI prints a DEP0169 url.parse() warning on every run).
 # - github_cli_skills: `gh skill update` only manages skills installed with `gh skill install`; skills
 #   installed by their own tool (graphify) or written by hand only produce "no GitHub metadata" notices.
 # - node: `npm update -g` fails because ~/.npmrc has bin-links=false and yo's postinstall runs `yodoctor`
 #   through a bin link; replaced by the custom command below with --ignore-scripts.
-disable = ["system", "snap", "flatpak", "firmware", "containers", "android_studio", "self_update", "node", "github_cli_skills"]
+disable = ["system", "snap", "flatpak", "firmware", "containers", "android_studio", "self_update", "node", "github_cli_skills", "vscode"]
 
 # Don't stop to ask "retry?" when a step fails; upall shows the failures in the summary.
 no_retry = true
@@ -22,3 +24,5 @@ notify_end = "never"
 [commands]
 # npm globals (gemini-cli, marp-cli, generator-code, yo) without install scripts, see [misc] disable.
 "npm globals" = "npm update -g --ignore-scripts"
+# VS Code extensions, as topgrade's own step, without the DEP0169 warning from VS Code's CLI (see [misc] disable).
+"Visual Studio Code extensions" = "command -v code >/dev/null || exit 0; NODE_OPTIONS=--no-deprecation code --update-extensions"

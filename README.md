@@ -138,7 +138,7 @@ when something goes wrong:
 5. **If snapd or flatpak themselves are in the apt upgrade**, those managers wait until apt is done.
 6. **Firmware is never applied unless you pass `--firmware`.**
 7. **A read-only btrfs snapshot of `/home` is taken before topgrade.** The tools topgrade updates (rustup, pipx,
-   uv, npm, VS Code extensions…) live in your home folder, which Timeshift doesn't cover. Kept: the newest 3, none
+   uv, npm, VS Code extensions…) live in your home folder, which Timeshift doesn't cover. Kept: the newest 2, none
    older than 14 days. To undo one tool, copy its folder back: see [Restoring one tool](#restoring-one-tool).
    Skipped when `/home` isn't its own btrfs subvolume; if the snapshot fails, topgrade runs anyway (each tool can
    also be reinstalled at an older version).
@@ -279,7 +279,7 @@ python3 ~/.local/lib/upall/secwatch.py --push "Title" "Message" [tags]
 upall was written for one KDE neon desktop and keeps a few of its choices as constants near the top of each file:
 
 - `bin/upall`: `KERNEL_MB=120` (size of one kernel + initramfs in `/boot`), `SNAP_KEEP=2` (Timeshift),
-  `TOOLS_KEEP=3` and `TOOLS_MAX_DAYS=14` (`/home` snapshots).
+  `TOOLS_KEEP=2` and `TOOLS_MAX_DAYS=14` (`/home` snapshots).
 - `lib/upall/secwatch.py`: `LOGIN_DELAY` (45 s; the network comes up ~30 s after login here), `RESUME_DELAY`,
   `MIN_INTERVAL`, `RENOTIFY`. Push titles start with the short host name.
 - The "Update now" button uses `wezterm`; replace it with `konsole -e` or your terminal.

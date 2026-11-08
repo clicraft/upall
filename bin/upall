@@ -11,7 +11,7 @@
 #
 # Safety: before apt, the plan is simulated. It asks (y/N) only when the plan removes packages or brings a
 # kernel that /boot may not hold; nothing to ask = nobody asked. A Timeshift snapshot is taken before apt
-# (last 2 kept), and a read-only btrfs snapshot of /home before topgrade (user-level tools; last 3, max 14 days).
+# (last 2 kept), and a read-only btrfs snapshot of /home before topgrade (user-level tools; last 2, max 14 days).
 # At the end PackageKit refreshes, so Discover and its tray icon see the new state.
 #
 # Logs: ~/.local/state/upall/<date-time>/<source>.log
@@ -252,7 +252,7 @@ pre_apt_snapshot() {  # Timeshift snapshot of / right before apt; keeps the newe
 # its folder back (README, "Restoring one tool"); never roll back all of /home. Kept: newest $TOOLS_KEEP, none
 # older than $TOOLS_MAX_DAYS (@home churns: downloads, caches and deleted files stay pinned by a snapshot).
 # upall-root makes the snapshot in /home/.snapshots (root-owned, created on first use) and prunes only its own.
-TOOLS_KEEP=3
+TOOLS_KEEP=2
 TOOLS_MAX_DAYS=14
 
 pre_tools_snapshot() {

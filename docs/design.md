@@ -41,7 +41,7 @@ tests without running anything.
 6. **parallel group**: nala ‖ flatpak ‖ snap, each to `$RUN/<name>.log`, exit code and duration to
    `$RUN/<name>.rc`. `wait_group` polls the `.rc` files so each job is reported the moment it ends.
 7. **topgrade** `--yes` (skipped by `--system`), after `upall-root home-snapshot` (read-only snapshot of `/home`,
-   which Timeshift doesn't cover) and `upall-root home-prune 3 14`.
+   which Timeshift doesn't cover) and `upall-root home-prune 2 14`.
 8. **firmware** check (`fwupdmgr get-updates --json`, using the metadata `fwupd-refresh.timer` already fetched),
    **PackageKit refresh**, **summary** with per-source exit codes and "Reboot required" if
    `/var/run/reboot-required` exists.
