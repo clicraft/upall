@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from rich.console import Console, Group
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 from rich.table import Table
@@ -26,6 +27,8 @@ ARCHIVES = "/var/cache/apt/archives"
 ENV_C = {**os.environ, "LC_ALL": "C.UTF-8"}
 # Every root command goes through upall-root (fixed actions only); upall passes the copy it checked.
 ROOT = os.environ.get("UPALL_ROOT", "/usr/local/sbin/upall-root")
+# sha256 of `upall-root plan`, the plan upall checked: upall-root upgrade refuses to run if the plan changed since.
+PLAN = os.environ.get("UPALL_PLAN", "")
 
 
 UNITS = ("B", "KiB", "MiB", "GiB", "TiB")   # IEC binary units, 1 KiB = 1024 B
@@ -156,10 +159,14 @@ def run_apt(job, rundir):
         job.state, job.note = "skipped", "up to date"
         event("apt: nothing to upgrade")
         return
+    if not re.fullmatch(r"[0-9a-f]{64}", PLAN):
+        job.finish(1, "no checked plan (UPALL_PLAN): start the TUI through upall --tui")
+        event("apt: FAILED, no checked plan")
+        return
     event(f"apt: {len(inst)} packages, {human(job.total)} to download")
     with open(f"{rundir}/apt.log", "w") as log:
-        # upall-root upgrade = nala upgrade --full -y --no-update with upall's apt options
-        p = popen(["sudo", "-n", ROOT, "upgrade"], log)
+        # upall-root upgrade = nala upgrade --full -y --no-update with upall's apt options, if the plan is unchanged
+        p = popen(["sudo", "-n", ROOT, "upgrade", PLAN], log)
     job.start("downloading" if files else "installing")
     pending = dict(files)
     seen = set()
@@ -696,12 +703,12 @@ def main():
             live.update(render(jobs.values(), t0, rundir, size=console.size, footer=f"logs: {rundir}"))
     except KeyboardInterrupt:
         console.print(f"\n[yellow]View closed. apt/dpkg and snapd keep running in the background "
-                      f"(flatpak stops where it was; that is safe). Logs: {rundir}[/]")
+                      f"(flatpak stops where it was; that is safe). Logs: {escape(rundir)}[/]")
         return 130
     bad = [j for j in jobs.values() if j.state == "failed"]
     for j in bad:
         log = f"{rundir}/{'topgrade' if j.name == 'tools' else j.name}.log"
-        console.print(f"[red]✘ {j.name}[/] {j.note}  [dim]{log}[/]")
+        console.print(f"[red]✘ {escape(j.name)}[/] {escape(j.note)}  [dim]{escape(log)}[/]")
         if os.path.exists(log):
             tail = open(log, errors="replace").read().strip().splitlines()[-8:]
             console.print(Text("\n".join("    " + l for l in tail), style="dim"))

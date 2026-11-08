@@ -45,12 +45,13 @@ How it works inside, and why it is built this way: [docs/design.md](docs/design.
   package. The layout adapts to the terminal width (full, compact, three-line, spinner-only) and follows resizes.
 - **Plain mode** keeps the terminal readable: a braille spinner with elapsed time and total download speed
   (`↓ 12.4 MiB/s`, IEC units) while waiting, and each job reported the moment it finishes.
-- **Safe by default**: a simulated apt plan first, questions only when it is risky, a Timeshift snapshot before
-  apt, config files kept, package jobs that survive Ctrl-C. See [Safety](#safety).
+- **Safe by default**: a simulated apt plan first, questions only when it is risky, the checked plan is the one
+  that runs, a Timeshift snapshot before apt, config files kept, package jobs that survive Ctrl-C. See
+  [Safety](#safety).
 - **Discover stays in sync**: at the end, PackageKit refreshes its cache, so Discover and its tray icon stop
   showing updates that are already installed.
 - **Security alerts** after login and resume (not on a timer: a sleeping PC has nothing to check), with optional
-  unattended install and phone pushes through [ntfy](https://ntfy.sh).
+  unattended install of the security updates only and phone pushes through [ntfy](https://ntfy.sh).
 - **Logs** for every run, one file per source.
 
 ## Requirements
@@ -94,7 +95,8 @@ Optional, once: `sudo nala fetch` to choose the fastest mirrors (pick 3 or so, i
 |---|---|
 | `upall check` | List what is outdated in apt, Flatpak, Snap, firmware, rustup and npm. Read-only. |
 | `upall` | Update: apt + Flatpak + Snap in parallel, then topgrade, then a firmware check. |
-| `upall --system`, `-s` | Only apt + Flatpak + Snap (no topgrade). This is what secwatch runs. |
+| `upall --system`, `-s` | Only apt + Flatpak + Snap (no topgrade). |
+| `upall --security` | Only apt's **security** updates (packages whose new version is in a `*-security` pocket, plus what they need): no other upgrades, no autoremove, no Flatpak/Snap/tools. This is what secwatch runs unattended. Not with `--tui`. |
 | `upall --tui`, `-t` | The update as a live table. Combine with `--system`. |
 | `upall --tui --demo` | Preview the table with fake jobs; changes nothing. |
 | `upall --ask`, `-a` | Always show the apt plan (upgrades, new packages, removals, auto-removals) and ask before running it. |
@@ -122,13 +124,16 @@ systems break). The same goes for plain mode.
 `upall` updates without asking in the normal case. These rules decide when it stops to ask, and what protects you
 when something goes wrong:
 
-1. **The apt plan is simulated first** (`apt-get -s full-upgrade`). upall asks `[y/N]` only if the plan
+1. **The apt plan is simulated first** (`upall-root plan`: the `Inst`/`Remv` lines of `apt-get -s full-upgrade`). upall asks `[y/N]` only if the plan
    **removes** packages, or brings a **new kernel** while two are installed or `/boot` is short of space. With
    nobody at the terminal to answer (secwatch, cron), the answer is "no": apt is skipped and the rest still runs.
    The packages nala will **auto-remove** afterwards (nothing needs them any more, mostly old kernels) are listed
    on every run, in the `apt plan:` line, but are expected and not a reason to ask. `--ask` shows the whole plan.
    apt runs as a **full upgrade** (`nala upgrade --full`), the same plan that was simulated: nala's own default
-   holds back anything that needs a new package, which includes every new kernel.
+   holds back anything that needs a new package, which includes every new kernel. **The checked plan is the one
+   that runs**: upall passes the plan's SHA-256 to `upall-root upgrade`, which simulates again as root right
+   before apt starts and refuses (exit 3, "the apt plan changed") if the apt lists changed in between, for example
+   because Discover or secwatch refreshed them. Run upall again: the new plan gets its own check.
 2. **A Timeshift snapshot is taken before apt** (comment `upall-pre-apt`); the newest 2 of upall's own are kept (each is deleted two updates later),
    Timeshift's scheduled snapshots are left alone. If the snapshot fails, upall asks whether to go on without one
    (no terminal: apt is skipped). No Timeshift installed: a note, and apt runs without a snapshot.
@@ -175,7 +180,9 @@ paths, no environment from the caller.
 |---|---|
 | `ping`, `version` | nothing (checks that the helper is reachable) |
 | `update`, `update-quiet` | `apt-get update -q` / `-qq` |
-| `upgrade` | `nala upgrade --full -y --no-update` with upall's apt options (`apt-get full-upgrade` + `autoremove` without nala), `DEBIAN_FRONTEND=noninteractive` |
+| `plan`, `plan-security` | nothing: no root needed. The `Inst`/`Remv` lines of a simulated full upgrade, or of the security-only install |
+| `upgrade HASH` | if `plan \| sha256sum` is still HASH: `nala upgrade --full -y --no-update` with upall's apt options (`apt-get full-upgrade` + `autoremove` without nala), `DEBIAN_FRONTEND=noninteractive`. Otherwise exit 3 |
+| `upgrade-security HASH` | the same check against `plan-security`, then `apt-get install --only-upgrade` of the packages with a security update (the helper picks them from `apt list --upgradable` itself; the caller can't name any) |
 | `snap-refresh [--no-wait\|--list]` | `snap refresh` |
 | `apt-partial` | `ls -ln /var/cache/apt/archives/partial` (TUI download progress) |
 | `ts-create`, `ts-prune KEEP` | Timeshift snapshot with the comment `upall-pre-apt`; delete those (only those) beyond the newest KEEP |
@@ -194,16 +201,17 @@ ticket alive; secwatch then can't refresh the apt lists or install anything.
 
 ```bash
 ./sbin/upall-root selftest                                     # must print "selftest: ok"
-sed "s/@USER@/$USER/" sudoers/upall-nopasswd > /tmp/upall-nopasswd
-visudo -c -f /tmp/upall-nopasswd                               # must say "parsed OK"
+sed "s/@USER@/$USER/" sudoers/upall-nopasswd > ~/.local/lib/upall/upall-nopasswd
+sudo visudo -c -f ~/.local/lib/upall/upall-nopasswd             # must say "parsed OK"
 sudo install -m 0755 -o root -g root sbin/upall-root /usr/local/sbin/upall-root
-sudo install -m 0440 -o root -g root /tmp/upall-nopasswd /etc/sudoers.d/upall-nopasswd
+sudo install -m 0440 -o root -g root ~/.local/lib/upall/upall-nopasswd /etc/sudoers.d/upall-nopasswd
 sudo -n /usr/local/sbin/upall-root ping                        # "ok", with no password prompt
 ```
 
 The helper must stay root-owned in a root-owned folder: a copy anywhere you can write to would let anything running
-as you change what it does. After `git pull`, reinstall it when `install.sh` says it changed (upall also warns when
-the installed helper's version differs).
+as you change what it does. After `git pull`, reinstall it when `install.sh` says it changed. While the installed
+helper is older than the one upall ships, upall warns and runs its own copy with your password instead;
+unattended runs (secwatch) stop at the password and notify you.
 
 ## Security alerts: upall-secwatch
 
@@ -216,8 +224,10 @@ signal), at most once every 3 hours. No timer: a sleeping PC has nothing to chec
 **What it does:**
 
 1. Waits for the network, refreshes the apt lists, and lists upgradable packages from a `*-security` pocket.
-2. If there are any and `AUTO_APPLY=1` (default), runs `upall --system` unattended. All the [safety](#safety)
-   rules apply, and since nobody can answer, a risky plan or a failed snapshot means nothing is installed.
+2. If there are any and `AUTO_APPLY=1` (default), runs `upall --security` unattended: those packages only (plus
+   anything they need), never the other pending upgrades, Flatpak, Snap or tools. All the [safety](#safety)
+   rules apply, and since nobody can answer, a risky plan, a failed snapshot or a plan that changed meanwhile
+   means nothing is installed.
 3. Whatever is still pending gets a desktop notification (and a phone push): **"N security updates need you"**
    after a failed automatic attempt, or "N security updates pending" with `AUTO_APPLY=0`. The notification has
    two buttons: **Update now** opens `upall --tui` in a new WezTerm window; **Details** opens Ubuntu's CVE page for
@@ -226,7 +236,7 @@ signal), at most once every 3 hours. No timer: a sleeping PC has nothing to chec
 **"Applied" pushes, whoever installs.** The service also follows `/var/log/dpkg.log`, which every installer writes:
 Discover, apt, nala, upall, and Discover's offline updates applied at boot. When dpkg has been quiet for 30 s after
 installing something, it checks which new versions came from a `*-security` pocket and sends one push:
-"N security updates applied", plus "Still pending: …" and "Reboot needed (not done automatically)" when they apply.
+"N security updates applied", plus "Still pending: N" and "Reboot needed (not done automatically)" when they apply.
 This needs no root code and no apt hook. On first start it only records where the log ends, so past updates are
 not announced.
 
@@ -239,8 +249,16 @@ cp examples/ntfy.conf ~/.config/upall/ntfy.conf && chmod 600 ~/.config/upall/ntf
 python3 ~/.local/lib/upall/secwatch.py --test-push
 ```
 
-The ntfy topic is the only secret: anyone who knows it can read and post. Keep `ntfy.conf` out of git
-(`.gitignore` already does). Without it, secwatch only shows desktop notifications.
+On the public ntfy.sh the topic is the only secret: anyone who knows it can read and post. Keep `ntfy.conf` out
+of git (`.gitignore` already does) and private (secwatch logs a warning if others can read it). Without it,
+secwatch only shows desktop notifications. What secwatch does to limit the damage if the topic leaks:
+
+- **Counts only**: pushes say "2 security updates pending", not which packages. `NTFY_DETAILS=1` adds the package
+  names and a CVE link, at the cost of telling whoever reads the topic what is unpatched on this machine.
+- **https only** (plain http only for a server on localhost), and **no redirects**: the message goes to
+  `NTFY_URL` or nowhere.
+- **Optional access token**: `NTFY_TOKEN=tk_…` is sent as `Authorization: Bearer`, for a reserved topic on
+  ntfy.sh or a self-hosted server with access control; then the topic name alone no longer lets anyone read.
 
 Turn automatic installing off with `AUTO_APPLY=0` in `~/.config/upall/secwatch.conf` (see `examples/secwatch.conf`).
 
@@ -264,7 +282,7 @@ python3 ~/.local/lib/upall/secwatch.py --push "Title" "Message" [tags]
 | `~/.local/lib/upall/secwatch.py` | security-alert service |
 | `~/.config/systemd/user/upall-secwatch.service` | its unit |
 | `~/.config/topgrade.toml` | which topgrade steps run ([example](examples/topgrade.toml)) |
-| `~/.config/upall/ntfy.conf` | phone push topic (secret, mode 600) |
+| `~/.config/upall/ntfy.conf` | phone push topic, optional token and `NTFY_DETAILS` (secret, mode 600) |
 | `~/.config/upall/secwatch.conf` | `AUTO_APPLY` |
 | `~/.local/state/upall/<date-time>/` | one run: `apt.log`, `flatpak.log`, `snap.log`, `apt-update.log`, `snapshot.log`, `packagekit.log`, and `topgrade.log` in TUI mode |
 | `~/.local/state/upall/secwatch-upall-*.log` | unattended runs started by secwatch |
@@ -294,9 +312,11 @@ upall was written for one KDE neon desktop and keeps a few of its choices as con
 | "no snapshot: upall-root isn't passwordless yet" | Install the root helper and the sudoers rule (`./install.sh` prints the commands). |
 | "/usr/local/sbin/upall-root is version N, upall ships M" | The helper changed: rerun `./install.sh` and run the helper install command it prints. |
 | "apt skipped" with nobody asked | The plan was risky and there was no terminal to confirm. Run `upall --ask` yourself. |
+| apt failed: "the apt plan changed since it was checked" | The apt lists were refreshed between upall's check and the upgrade (Discover, secwatch, another terminal). Nothing was installed; run upall again. |
+| "upall-root is version 1, upall ships 2" | The installed helper is older: run `./install.sh` and the `sudo install` command it prints. Until then upall asks for your password and secwatch can't install. |
 | Discover still lists updates you installed | Discover was open before; press "Refresh" once. upall refreshes PackageKit at the end of each run. |
 | A topgrade step fails | Plain mode prints topgrade's output; in the TUI see `topgrade.log` in the run's log folder. Disable the step in `~/.config/topgrade.toml` if it keeps failing. |
-| No phone pushes | `secwatch.py --test-push`; check `~/.config/upall/ntfy.conf` and the topic in the app. |
+| No phone pushes | `secwatch.py --test-push`, then `journalctl --user -u upall-secwatch` ("NTFY_URL must be https://", "ntfy push failed"); check `~/.config/upall/ntfy.conf` and the topic in the app. |
 
 ## Uninstall
 

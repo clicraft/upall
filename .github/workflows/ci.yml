@@ -17,7 +17,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-24.04          # same ShellCheck (0.9.0) as Ubuntu 24.04 desktops
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09   # v5.1.0
       - name: ShellCheck version
         run: shellcheck --version
       - name: Lint shell scripts
@@ -31,7 +31,7 @@ jobs:
     name: python syntax
     runs-on: ubuntu-24.04          # system Python 3.12, as on Ubuntu 24.04 desktops
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09   # v5.1.0
       - name: Compile every Python file
         run: |
           python3 --version
@@ -43,7 +43,7 @@ jobs:
     name: visudo
     runs-on: ubuntu-24.04          # sudo 1.9.15: regex arguments (^…$) need 1.9.10 or later
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09   # v5.1.0
       - name: Check the sudoers template
         # the same substitution install.sh makes, then sudo's own parser
         run: |
@@ -55,21 +55,28 @@ jobs:
     name: upall-root checks
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09   # v5.1.0
       - name: Snapshot-selection selftest
         run: sbin/upall-root selftest
       - name: Rejects anything outside its fixed actions (exit 2), before needing root
         run: |
           bad=("" bogus "ts-prune" "ts-prune 0" "ts-prune 21" "ts-prune x" "ts-prune 3 4" "home-prune 3"
                "home-prune 3 999" "snap-refresh --channel=edge" "snap-refresh --list x"
-               "update -o APT::Update::Pre-Invoke::=sh" "upgrade --purge" "ping now")
+               "update -o APT::Update::Pre-Invoke::=sh" "upgrade --purge" "ping now"
+               "upgrade" "upgrade-security" "upgrade abc" "upgrade $(printf 'A%.0s' {1..64})"
+               "upgrade $(printf 'a%.0s' {1..63})" "plan x" "plan-security --full")
           for a in "${bad[@]}"; do
             set +e; sbin/upall-root $a >/dev/null 2>&1; rc=$?; set -e
             echo "[$a] -> $rc"; [ "$rc" -eq 2 ] || exit 1
           done
       - name: Valid actions need root (exit 4) when run without sudo
         run: |
-          for a in ping update upgrade "ts-prune 3" "home-prune 3 14" "snap-refresh --no-wait"; do
+          h=$(printf 'a%.0s' {1..64})
+          for a in ping update "upgrade $h" "upgrade-security $h" "ts-prune 3" "home-prune 3 14" "snap-refresh --no-wait"; do
             set +e; sbin/upall-root $a >/dev/null 2>&1; rc=$?; set -e
             echo "[$a] -> $rc"; [ "$rc" -eq 4 ] || exit 1
           done
+      - name: Plans are simulated without root, and hash the same on every call
+        run: |
+          sbin/upall-root plan | tee plan1; sbin/upall-root plan-security
+          [ "$(sbin/upall-root plan | sha256sum)" = "$(sha256sum < plan1)" ]

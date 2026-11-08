@@ -7,8 +7,8 @@ Runs as a systemd user service in the Plasma session (~/.config/systemd/user/upa
   - no check if the last one was less than MIN_INTERVAL ago (several short naps = one check)
 The check: wait for the network, refresh apt lists (passwordless `sudo -n upall-root update-quiet`), list upgradable
 packages from a *-security pocket. If there are any and AUTO_APPLY is on (default; AUTO_APPLY=0 in
-~/.config/upall/secwatch.conf turns it off), `upall --system` installs them unattended, with all of upall's
-safety rules; the dpkg.log watcher below pushes "applied". If they are still pending after that (or AUTO_APPLY=0),
+~/.config/upall/secwatch.conf turns it off), `upall --security` installs them unattended (those packages only,
+no other upgrades), with all of upall's safety rules; the dpkg.log watcher below pushes "applied". If they are still pending after that (or AUTO_APPLY=0),
 a KDE notification: "Update now" opens `upall --tui`
 in a new WezTerm window, "Details" opens Ubuntu's CVE pages for those packages. The same set is not
 announced again within RENOTIFY. Only security updates: Discover's own notifier covers the rest.
@@ -25,10 +25,13 @@ Applied updates: whoever installs them (Discover, apt, nala, upall, offline upda
 and pushes "N security updates applied" for versions that come from a *-security pocket.
 Nothing here ever reboots the PC: "Reboot needed" is only a message.
 
-Phone: the same alert is pushed through ntfy (https://ntfy.sh) to the topic in ~/.config/upall/ntfy.conf.
-The topic name is the only secret (anyone who knows it can read/post): kept out of git.
+Phone: the same alert is pushed through ntfy (https://ntfy.sh) to the topic in ~/.config/upall/ntfy.conf
+(mode 600, kept out of git): NTFY_URL (https only; plain http just for localhost), optional NTFY_TOKEN (an ntfy
+access token, for a reserved or self-hosted topic) and NTFY_DETAILS. Pushes carry counts only: anyone who learns
+the topic would otherwise read which vulnerable packages this machine has. NTFY_DETAILS=1 adds package names
+and a CVE link. Redirects are refused, so the message and token never go anywhere but NTFY_URL.
 """
-import json, os, re, socket, subprocess, sys, threading, time, urllib.request
+import json, os, re, socket, stat, subprocess, sys, threading, time, urllib.parse, urllib.request
 
 from gi.repository import Gio, GLib
 
@@ -86,30 +89,58 @@ def source_packages(pkgs):
     return sorted(set(filter(None, out.split())))
 
 
-def ntfy_url():
+def ntfy_conf():
+    """KEY=value pairs from NTFY_CONF ({} without the file). Warns if others can read it (the topic is a secret)."""
+    conf = {}
     try:
-        for line in open(NTFY_CONF):
-            if line.startswith("NTFY_URL="):
-                return line.split("=", 1)[1].strip()
+        with open(NTFY_CONF) as f:
+            if stat.S_IMODE(os.fstat(f.fileno()).st_mode) & 0o077:
+                log(f"warning: {NTFY_CONF} is readable by others: chmod 600 it")
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep and k.startswith("NTFY_"):
+                    conf[k] = v.strip().strip("'\"")
     except OSError:
         pass
-    return None
+    return conf
 
 
-def push(title, message, click=None, priority="high", tags="rotating_light"):
-    """Phone push through ntfy (topic in NTFY_CONF). Silent no-op without a config; never raises."""
-    url = ntfy_url()
+def ntfy_url_ok(url):
+    u = urllib.parse.urlsplit(url)
+    if u.scheme == "https" and u.hostname:
+        return True
+    return u.scheme == "http" and u.hostname in ("localhost", "127.0.0.1", "::1")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None          # a 3xx becomes an error: never re-send the message (or token) elsewhere
+
+
+def push(title, message, details="", click=None, priority="high", tags="rotating_light"):
+    """Phone push through ntfy (NTFY_CONF). `details` (package names) and `click` are sent only with
+    NTFY_DETAILS=1. Silent no-op without a config; never raises."""
+    conf = ntfy_conf()
+    url = conf.get("NTFY_URL")
     if not url:
         return
+    if not ntfy_url_ok(url):
+        log("ntfy push not sent: NTFY_URL must be https:// (plain http only for localhost)")
+        return
+    full = conf.get("NTFY_DETAILS", "0") in ("1", "yes", "true")
+    if full and details:
+        message = f"{message}\n{details}"
     headers = {"Title": title.encode(), "Priority": priority, "Tags": tags}
-    if click:
+    if full and click:
         headers["Click"] = click
+    if conf.get("NTFY_TOKEN"):
+        headers["Authorization"] = f"Bearer {conf['NTFY_TOKEN']}"
     try:
         req = urllib.request.Request(url, data=message.encode(), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=15) as r:
             log(f"ntfy push sent ({r.status})")
     except Exception as e:  # network down, ntfy.sh unreachable: the desktop notification still shows
-        log(f"ntfy push failed: {e}")
+        log(f"ntfy push failed: {type(e).__name__}: {getattr(e, 'reason', '') or getattr(e, 'code', '')}")
 
 
 # ------------------------------------------------------------ applied security updates (any installer)
@@ -162,13 +193,14 @@ def report_applied():
         if not sec:
             return
         pending = [p for p, _ in security_updates()]
-        body = " ".join(p for p, _ in sec)
+        n = len(sec)
+        body = f"{n} package{'s' if n != 1 else ''} from the security pocket"
         if pending:
-            body += "\nStill pending: " + " ".join(pending)
+            body += f"\nStill pending: {len(pending)}"
         if os.path.exists("/var/run/reboot-required"):
             body += "\nReboot needed (not done automatically)"
-        n = len(sec)
-        push(f"{HOST}: {n} security update{'s' if n != 1 else ''} applied", body,
+        details = "Applied: " + " ".join(p for p, _ in sec) + ("\nPending: " + " ".join(pending) if pending else "")
+        push(f"{HOST}: {n} security update{'s' if n != 1 else ''} applied", body, details,
              priority="default", tags="white_check_mark,lock")
     finally:
         DPKG_LOCK.release()
@@ -212,20 +244,20 @@ def desktop(title, body, urgency="normal", icon="security-high"):
 
 
 def auto_apply(updates):
-    """Run `upall --system` unattended. Its own safety rules apply: with nobody to answer, a risky apt plan
-    (removals, kernel vs /boot) or a failed Timeshift snapshot means apt is skipped. The phone's "applied"
+    """Run `upall --security` unattended: those security updates only, nothing else. Its own safety rules apply: with nobody to answer, a risky apt plan
+    (removals, kernel vs /boot), a failed Timeshift snapshot or a plan that changed meanwhile means apt is skipped. The phone's "applied"
     push comes from the dpkg.log watcher (report_applied). Never reboots. Returns what is still pending."""
     names = " ".join(p for p, _ in updates)
     desktop(f"Installing {len(updates)} security update{'s' if len(updates) != 1 else ''}…", names,
             urgency="low", icon="system-software-update")
     os.makedirs(RUNLOG_DIR, exist_ok=True)
     runlog = os.path.join(RUNLOG_DIR, f"secwatch-upall-{time.strftime('%Y%m%d-%H%M%S')}.log")
-    log(f"running upall --system (log {runlog})")
+    log(f"running upall --security (log {runlog})")
     with open(runlog, "w") as f:
-        rc = subprocess.run([UPALL, "--system"], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+        rc = subprocess.run([UPALL, "--security"], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
                             env={**os.environ, "TERM": "dumb"}).returncode
     remaining = security_updates()
-    log(f"upall --system exit {rc}; {len(remaining)} security update(s) still pending")
+    log(f"upall --security exit {rc}; {len(remaining)} security update(s) still pending")
     if not remaining:
         reboot = os.path.exists("/var/run/reboot-required")
         desktop(f"{len(updates)} security update{'s' if len(updates) != 1 else ''} installed",
@@ -238,7 +270,7 @@ def notify(updates, title=None):
     shown = ", ".join(names[:6]) + (f" +{len(names) - 6}" if len(names) > 6 else "")
     title = title or f"{len(names)} security update{'s' if len(names) != 1 else ''} pending"
     srcs = source_packages(names)
-    push(f"{HOST}: {title}", ", ".join(names) + "\nRun: upall --tui",
+    push(f"{HOST}: {title}", "Run: upall --tui", ", ".join(names),
          click=f"https://ubuntu.com/security/cves?package={srcs[0]}" if srcs else None)
     r = subprocess.run(["notify-send", "-a", "upall", "-i", "security-medium", "-u", "critical",
                         "-A", "update=Update now", "-A", "details=Details", title, shown],

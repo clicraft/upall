@@ -11,7 +11,7 @@ lib/upall/tui.py          Python + rich: the --tui live view; runs the same jobs
 lib/upall/pk_refresh.py   Python + gi: one PackageKit RefreshCache over D-Bus
 lib/upall/secwatch.py     Python + gi: user service, login/resume checks, dpkg.log watcher, ntfy pushes
 systemd/                  the user unit for secwatch
-sbin/upall-root           bash, root-owned when installed: the only commands upall runs as root
+sbin/upall-root           bash, root-owned when installed: the only commands upall runs as root, and the apt plans
 sudoers/                  passwordless rule template (@USER@): allows only sbin/upall-root
 examples/                 topgrade.toml, ntfy.conf, secwatch.conf
 ```
@@ -30,7 +30,8 @@ tests without running anything.
    helper if installed, else the copy in `~/.local/lib/upall`. The helper path is exported as `UPALL_ROOT` for the TUI.
 2. **apt lists**: `upall-root update` behind a spinner.
 3. **serial check**: if the upgrade contains `snapd` or `flatpak`/`libflatpak0`, that manager runs after apt.
-4. **apt_safety**: `apt-get -s -o Debug::NoLocking=1 full-upgrade`; parses `Inst`/`Remv` lines; counts
+4. **apt_safety**: `upall-root plan` (no root: the `Inst`/`Remv` lines of `apt-get -s -o Debug::NoLocking=1
+   full-upgrade`) saved to `$RUN/apt-plan.txt`, and its SHA-256 kept for the upgrade; counts
    new `linux-image-[0-9]*` packages against installed kernels and free space in `/boot`. The auto-removals
    come from python-apt, with the same calls nala makes (`Cache.upgrade(dist_upgrade=True)`, then every
    installed package that `is_auto_removable`); they count as apt work, so a run that only auto-removes still
@@ -38,13 +39,21 @@ tests without running anything.
 5. **pre_apt_snapshot**: `upall-root ts-create` (Timeshift `--create --comments upall-pre-apt --scripted`), then
    `upall-root ts-prune 2`: from `timeshift --list --scripted`, rows whose comment is *exactly* `upall-pre-apt`
    (the tag letters are skipped), oldest first, all but the newest 2.
-6. **parallel group**: nala ‖ flatpak ‖ snap, each to `$RUN/<name>.log`, exit code and duration to
+6. **parallel group**: nala (`upall-root upgrade HASH`) ‖ flatpak ‖ snap, each to `$RUN/<name>.log`, exit code and duration to
    `$RUN/<name>.rc`. `wait_group` polls the `.rc` files so each job is reported the moment it ends.
 7. **topgrade** `--yes` (skipped by `--system`), after `upall-root home-snapshot` (read-only snapshot of `/home`,
    which Timeshift doesn't cover) and `upall-root home-prune 2 14`.
 8. **firmware** check (`fwupdmgr get-updates --json`, using the metadata `fwupd-refresh.timer` already fetched),
    **PackageKit refresh**, **summary** with per-source exit codes and "Reboot required" if
    `/var/run/reboot-required` exists.
+
+**The checked plan is the one that runs.** Between the check and the upgrade the apt lists can change (Discover,
+secwatch or another terminal runs `apt-get update`), and the new plan could hold a removal nobody approved. The
+plan is therefore produced by one function in `upall-root` (`plan`), which upall runs as itself to check and
+`upgrade HASH` runs again as root right before `exec nala`: a different SHA-256 = exit 3, nothing installed.
+Both sides hash the raw output stream, so an empty plan matches too. The window left is the moment between that
+second simulation and nala's own, which is too short for a list refresh to matter. `--security` works the same
+way with `plan-security` / `upgrade-security HASH`.
 
 nala runs as `nala upgrade --full`. Without `--full`, nala follows `full_upgrade = false` in
 `/etc/nala/nala.conf` (its default), which is `apt-get upgrade`: no new packages and no removals, so a new kernel
@@ -115,8 +124,12 @@ the connection that created it; `busctl` per call fails with "sender does not ma
 - **Triggers**: login (`LOGIN_DELAY` after the service starts in `graphical-session.target`) and resume (logind
   `PrepareForSleep(false)`). A timer makes no sense on a PC that sleeps when idle.
 - **Security updates** = `apt list --upgradable` rows whose suite contains `-security`.
-- **Auto apply** runs `upall --system` with stdin from `/dev/null` and `TERM=dumb`: no spinner, and every
-  question upall would ask is answered "no", so only safe plans run.
+- **Auto apply** runs `upall --security` with stdin from `/dev/null` and `TERM=dumb`: no spinner, and every
+  question upall would ask is answered "no", so only safe plans run. `--security` installs only the packages
+  whose candidate is in a `*-security` pocket (`apt-get install --only-upgrade`, no autoremove), the same rule
+  secwatch uses to count them; the list is built by `upall-root` itself, never passed in. Before this, the
+  unattended run was `upall --system`: a security fix at login also pulled every other pending upgrade, plus
+  Flatpak and Snap, with nobody watching.
 - **Applied updates (dpkg.log watcher)**. The goal was a push when security updates are applied by *any*
   installer, Discover included. An apt hook (`DPkg::Post-Invoke`) would run as root inside apt, would need to
   read the user's ntfy settings, and would miss nothing that dpkg.log doesn't already record. Instead secwatch
@@ -124,8 +137,11 @@ the connection that created it; `busctl` per call fails with "sender does not ma
   `upgrade`/`install` lines from a saved offset (handling rotation by inode), and asks `apt-cache madison`
   whether each new version is offered by a `*-security` pocket. KDE neon's own packages never count.
   `SECWATCH_DPKG_LOG` overrides the path for tests.
-- **ntfy**: plain HTTP POST with `Title`, `Priority`, `Tags` and `Click` headers; never raises (network down =
-  only the desktop notification).
+- **ntfy**: HTTP POST with `Title`, `Priority`, `Tags` (and `Click`, `Authorization`) headers; never raises
+  (network down = only the desktop notification). On public ntfy.sh the topic name is the whole access control,
+  so the pushes assume it may leak: counts only unless `NTFY_DETAILS=1`, `https://` required (http only to
+  localhost), redirects refused (a 3xx would re-send the body, and the token, to another host), optional
+  `NTFY_TOKEN` for a reserved topic, and a log warning when `ntfy.conf` is readable by others.
 - **No reboot, anywhere.** Nothing calls `reboot`, `shutdown`, `systemctl reboot/poweroff/suspend`, or `kexec`;
   `unattended-upgrades` (which has an automatic-reboot option) isn't used.
 
@@ -147,6 +163,11 @@ caller pick debconf's `Editor` frontend, a root editor if a package asks a quest
   can redirect a snapshot or a delete with a planted symlink.
 - Long actions `exec` the real command, so signals and exit codes pass through unchanged.
 
+Audit follow-ups (2026-11-08): the plan hash and `upgrade-security` above; failure lines in the TUI escape rich
+markup (`rich.markup.escape`: a log line with `[...]` can't restyle or break the output); CI pins
+`actions/checkout` to a commit SHA, not a movable tag; `install.sh` writes the filled-in sudoers rule to
+`~/.local/lib/upall/` instead of `/tmp`, and the command it prints runs `visudo -c` again right before installing.
+
 Other notes: `env` must never be allowed in a NOPASSWD rule (it runs anything). Timeshift 24.01 rejects
 `--tags O` although `--help` lists it; O (on demand) is the default, so it is left out.
 
@@ -158,5 +179,11 @@ routine plan: no question); snapshot create/prune; PackageKit refresh; the TUI l
 login check and pushes; the dpkg.log watcher with a fake log (baseline: no push; openssl from `-security` flagged,
 a Plasma update ignored; rescan: nothing).
 
-Not yet seen in a real event: the resume trigger, an unattended security install, the dpkg watcher on a real
-Discover security update, the TUI's byte bars on large real downloads.
+Tested 2026-11-08: `upall-root plan`/`plan-security` and the hash match on an empty plan, the security-package
+selection on sample `apt list` lines (security pocket only, i386 qualified, bad names dropped), the argument
+checks (CI), the old-helper fallback with no terminal (stops at the password, exit 1), the ntfy rules against a
+local server (counts only, details opt-in, token header, redirect refused, plain http to a remote refused).
+
+Not yet seen in a real event: the resume trigger, an unattended security install (`upgrade-security` with real
+packages), a "plan changed" refusal, the dpkg watcher on a real Discover security update, the TUI's byte bars
+on large real downloads.

@@ -74,21 +74,25 @@ fi
 # Root helper + sudoers rule: prepare and check; you install them.
 helper=$PWD/sbin/upall-root
 "$helper" selftest >/dev/null || { echo "WARNING: sbin/upall-root selftest failed; not suggesting it"; exit 1; }
-tmp=$(mktemp --suffix=.upall-sudoers)
-sed "s/@USER@/$(id -un)/g" sudoers/upall-nopasswd >"$tmp"
-if ! /usr/sbin/visudo -c -q -f "$tmp" >/dev/null 2>&1; then
-    echo "WARNING: visudo rejects the generated sudoers file ($tmp); not suggesting it"; exit 1
+# The filled-in rule is kept next to the helper copy (your home, not /tmp), and checked again by the command
+# you run, right before it is installed.
+rule=$LIB/upall-nopasswd
+mkdir -p "$LIB"
+sed "s/@USER@/$(id -un)/g" sudoers/upall-nopasswd >"$rule"
+chmod 0644 "$rule"
+if ! /usr/sbin/visudo -c -q -f "$rule" >/dev/null 2>&1; then
+    echo "WARNING: visudo rejects the generated sudoers file ($rule); not suggesting it"; exit 1
 fi
 root_cmds=()
 cmp -s "$helper" /usr/local/sbin/upall-root ||
     root_cmds+=("sudo install -m 0755 -o root -g root $helper /usr/local/sbin/upall-root")
 # /etc/sudoers.d is root-only, so test what matters: does the helper already run without a password?
 sudo -n /usr/local/sbin/upall-root ping >/dev/null 2>&1 ||
-    root_cmds+=("sudo install -m 0440 -o root -g root $tmp /etc/sudoers.d/upall-nopasswd")
+    root_cmds+=("sudo visudo -c -f $rule && sudo install -m 0440 -o root -g root $rule /etc/sudoers.d/upall-nopasswd")
 if ((${#root_cmds[@]})); then
     echo
-    echo "Root helper and passwordless rule for unattended runs (read them first: $helper, $tmp):"
+    echo "Root helper and passwordless rule for unattended runs (read them first: $helper, $rule):"
     printf '  %s\n' "${root_cmds[@]}"
 else
-    echo "upall-root: installed, up to date and passwordless"; rm -f "$tmp"
+    echo "upall-root: installed, up to date and passwordless"
 fi

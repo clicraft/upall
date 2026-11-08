@@ -8,6 +8,7 @@
 #   upall --tui        same update, shown as a live table (speed, sizes, current package per source)
 #   upall --tui --demo preview the live table with fake jobs (changes nothing)
 #   upall --ask        always show the apt plan and ask before running it
+#   upall --security   only apt's security updates (what upall-secwatch runs unattended); no Flatpak/Snap/tools
 #
 # Safety: before apt, the plan is simulated. It asks (y/N) only when the plan removes packages or brings a
 # kernel that /boot may not hold; nothing to ask = nobody asked. A Timeshift snapshot is taken before apt
@@ -38,7 +39,7 @@ head_() { printf '\n%s== %s ==%s\n' "$B" "$*" "$N"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 fmt_t() { printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------- spinner
 # Download speed for the spinner line: the whole machine's receive rate, from the interface counters in
@@ -175,7 +176,8 @@ do_check() {
 # ---------------------------------------------------------------- safety checks before apt
 KERNEL_MB=120        # one kernel + initramfs in /boot (~112 MB on Ubuntu 24.04); a 500 MB /boot holds two
 SNAP_KEEP=2          # upall-pre-apt Timeshift snapshots kept: each one is deleted two updates later
-APT_SKIP=0 APT_WORK=0
+APT_SKIP=0 APT_WORK=0 APT_PLAN=
+SECURITY=0           # --security: apt's security updates only (upall-root plan-security / upgrade-security)
 
 ask_yn() {  # ask_yn QUESTION: yes -> 0. Nobody at a terminal to answer = "no".
     local a
@@ -196,18 +198,25 @@ print("\n".join(sorted(p.name for p in c if p.is_installed and not p.marked_dele
 }
 
 apt_safety() {  # $1 = 1: always show the plan and ask (--ask)
-    local sim inst new remv auto kern boot_free nkern reasons=() r
-    sim=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 full-upgrade 2>/dev/null)
-    mapfile -t inst < <(awk '/^Inst /{print $2}' <<<"$sim")
-    mapfile -t new  < <(awk '/^Inst / && $3 !~ /^\[/{print $2}' <<<"$sim")
-    mapfile -t remv < <(awk '/^Remv /{print $2}' <<<"$sim")
-    mapfile -t auto < <(auto_removals | grep .)   # grep: no empty line = no phantom package
+    local inst new remv auto=() kern boot_free nkern reasons=() r what=plan plan=$RUN/apt-plan.txt
+    ((SECURITY)) && what="plan-security"
+    # The plan comes from upall-root itself (no root needed) and its hash goes back with the upgrade: if the apt
+    # lists change before apt runs (a refresh in between), upall-root refuses instead of running an unchecked plan.
+    if ! "$ROOT" "$what" >"$plan" 2>"$RUN/apt-plan.err"; then
+        say "${R}✘ apt simulation failed${N} ($(tail -n 1 "$RUN/apt-plan.err")): apt skipped"; APT_SKIP=1; return 0
+    fi
+    APT_PLAN=$(sha256sum <"$plan"); APT_PLAN=${APT_PLAN%% *}
+    mapfile -t inst < <(awk '/^Inst /{print $2}' "$plan")
+    mapfile -t new  < <(awk '/^Inst / && $3 !~ /^\[/{print $2}' "$plan")
+    mapfile -t remv < <(awk '/^Remv /{print $2}' "$plan")
+    # nala's autoremove; the security path doesn't autoremove. grep: no empty line = no phantom package.
+    ((SECURITY)) || mapfile -t auto < <(auto_removals | grep .)
     mapfile -t kern < <(printf '%s\n' "${new[@]}" | grep -E '^linux-image-[0-9]')
     # nala removes the auto-removable packages even when nothing is upgraded: that counts as work (snapshot).
     APT_WORK=$(( ${#inst[@]} + ${#remv[@]} + ${#auto[@]} ))
     boot_free=$(df --output=avail -m /boot | tail -1 | tr -d ' ')
     nkern=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-[0-9]*' 2>/dev/null | grep -c '^ii ')
-    say "${D}apt plan: ${#inst[@]} to upgrade/install (${#new[@]} new), ${#remv[@]} to remove," \
+    say "${D}apt ${what/plan-security/security plan}: ${#inst[@]} to upgrade/install (${#new[@]} new), ${#remv[@]} to remove," \
         "${#auto[@]} to auto-remove${auto[*]:+ (${auto[*]})};" \
         "/boot ${boot_free} MB free, ${nkern} kernel(s) installed${N}"
     ((APT_WORK)) || return 0
@@ -300,15 +309,16 @@ run_job() {  # name, command... ; output goes to $RUN/name.log, exit code to $RU
 }
 
 # upgrade = `nala upgrade --full` (the full upgrade apt_safety simulated; nala's default would hold back new
-# kernels), or apt-get full-upgrade + autoremove without nala. Options and DEBIAN_FRONTEND are set by upall-root.
-job_apt()     { sudo -n "$ROOT" upgrade; }
+# kernels), or apt-get full-upgrade + autoremove without nala; upgrade-security = only the security updates.
+# Both run only if the plan's hash still matches. Options and DEBIAN_FRONTEND are set by upall-root.
+job_apt() { if ((SECURITY)); then sudo -n "$ROOT" upgrade-security "$APT_PLAN"; else sudo -n "$ROOT" upgrade "$APT_PLAN"; fi; }
 job_flatpak() { LC_ALL=C.UTF-8 flatpak update -y --noninteractive; }
 job_snap()    { sudo -n "$ROOT" snap-refresh; }
 
 summary_line() {  # name -> one line from the log worth showing
     local log=$RUN/$1.log
     case $1 in
-        apt)     grep -E -o '(Upgrade|Install|Auto-Remove|Remove) +[0-9]+ Packages?|Nothing to do|All packages are up to date' "$log" | paste -sd',' ;;
+        apt)     grep -E -o '(Upgrade|Install|Auto-Remove|Remove) +[0-9]+ Packages?|Nothing to do|All packages are up to date|[0-9]+ upgraded, [0-9]+ newly installed, [0-9]+ to remove|no security updates|plan changed' "$log" | paste -sd',' ;;
         flatpak) grep -q 'Nothing to do' "$log" && echo 'nothing to do' || echo "updated: $(grep -c '^Updating' "$log")" ;;
         snap)    tail -n 3 "$log" | paste -sd'; ' ;;
     esac
@@ -345,15 +355,19 @@ do_update() {
 
     # With upall-root installed and allowed in /etc/sudoers.d/upall-nopasswd, no password; otherwise ask once
     # and keep the ticket alive. (`sudo -l` can't tell: it also lists commands that need a password.)
-    if spin "Checking sudo" /dev/null sudo -n "$ROOT_SYS" ping; then
+    # An installed helper older than the one upall ships lacks actions upall uses: the shipped copy runs instead,
+    # with your password (unattended runs stop there) until the new one is installed.
+    local v_sys v_local
+    v_sys=$("$ROOT_SYS" version 2>/dev/null) v_local=$("$ROOT_LOCAL" version 2>/dev/null)
+    if [[ -n $v_sys && -n $v_local && $v_sys != "$v_local" ]]; then
+        say "${Y}! $ROOT_SYS is version $v_sys, upall ships $v_local: run install.sh and the commands it prints${N}"
+        ROOT=$ROOT_LOCAL
+    fi
+    if [[ $ROOT == "$ROOT_SYS" ]] && spin "Checking sudo" /dev/null sudo -n "$ROOT_SYS" ping; then
         say "${D}sudo: upall-root is passwordless${N}"
-        local v_sys v_local
-        v_sys=$("$ROOT_SYS" version 2>/dev/null) v_local=$("$ROOT_LOCAL" version 2>/dev/null)
-        [[ -z $v_local || $v_sys == "$v_local" ]] ||
-            say "${Y}! $ROOT_SYS is version $v_sys, upall ships $v_local: run install.sh and the command it prints${N}"
     else
         head_ "sudo"
-        [[ -x $ROOT_SYS ]] || ROOT=$ROOT_LOCAL
+        [[ -x $ROOT ]] || ROOT=$ROOT_LOCAL
         [[ -x $ROOT ]] || { say "${R}upall-root not found ($ROOT_SYS or $ROOT_LOCAL): run install.sh${N}"; exit 1; }
         sudo -v || { say "${R}sudo is needed for apt, snap and the snapshots.${N}"; exit 1; }
         ( while :; do sudo -n -v 2>/dev/null; sleep 50; done ) & SUDO_KEEPALIVE=$!
@@ -364,6 +378,16 @@ do_update() {
         say "${G}✔${N} apt lists refreshed ${D}in $(fmt_t "$SPIN_T")${N}"
     else
         say "${R}✘ apt-get update failed:${N}"; grep -E '^(E|W):' "$RUN/apt-update.log" | sed 's/^/    /'
+    fi
+
+    if ((SECURITY)); then
+        apt_safety "$ask"
+        pre_apt_snapshot
+        head_ "apt security updates ${D}(logs: $RUN)${N}"
+        if ((APT_SKIP)); then :
+        elif ((APT_WORK)); then run_job apt job_apt; wait_group
+        else say "${G}✔${N} no security updates"; fi
+        fw_and_summary none; return
     fi
 
     # If the upgrade includes snapd or flatpak themselves, don't update them while they're in use.
@@ -381,7 +405,7 @@ do_update() {
         [[ $with_topgrade == 1 ]] || targs+=(--no-tools)
         ((${#serial[@]})) && targs+=(--after-apt "$(IFS=,; echo "${serial[*]}")")
         ((APT_SKIP)) && targs+=(--skip-apt)
-        python3 -I "$TUI" "${targs[@]}"; RESULT[tui]=$?
+        UPALL_PLAN=$APT_PLAN python3 -I "$TUI" "${targs[@]}"; RESULT[tui]=$?
         fw_and_summary "$with_fw"; return
     fi
 
@@ -412,7 +436,7 @@ do_update() {
 
 fw_and_summary() {
     local with_fw=$1
-    if have fwupdmgr; then
+    if have fwupdmgr && [[ $with_fw != none ]]; then
         head_ "Firmware"
         if [[ $with_fw == 1 ]]; then fwupdmgr refresh >/dev/null 2>&1; fwupdmgr update; RESULT[firmware]=$?
         else
@@ -452,6 +476,7 @@ for a in "$@"; do
         --tui|-t)         tui=1 ;;
         --demo)           demo=1 ;;
         --ask|-a)         ask=1 ;;
+        --security)       SECURITY=1 topgrade_on=0 ;;
         -h|--help|help)   usage; exit 0 ;;
         *) say "unknown option: $a"; usage; exit 2 ;;
     esac
@@ -460,5 +485,6 @@ done
 case $mode in
     check)  do_check ;;
     update) if ((demo)); then exec python3 -I "$TUI" --demo; fi
+            if ((SECURITY && tui)); then say "--security runs without the TUI (it is meant for unattended runs)"; exit 2; fi
             do_update "$topgrade_on" "$fw" "$tui" "$ask" ;;
 esac
