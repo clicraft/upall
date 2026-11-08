@@ -129,7 +129,7 @@ when something goes wrong:
    on every run, in the `apt plan:` line, but are expected and not a reason to ask. `--ask` shows the whole plan.
    apt runs as a **full upgrade** (`nala upgrade --full`), the same plan that was simulated: nala's own default
    holds back anything that needs a new package, which includes every new kernel.
-2. **A Timeshift snapshot is taken before apt** (comment `upall-pre-apt`); the newest 3 of upall's own are kept,
+2. **A Timeshift snapshot is taken before apt** (comment `upall-pre-apt`); the newest 2 of upall's own are kept (each is deleted two updates later),
    Timeshift's scheduled snapshots are left alone. If the snapshot fails, upall asks whether to go on without one
    (no terminal: apt is skipped). No Timeshift installed: a note, and apt runs without a snapshot.
 3. **Config files you changed are kept** (`--force-confold`), and dpkg never stops to ask about them.
@@ -278,7 +278,7 @@ python3 ~/.local/lib/upall/secwatch.py --push "Title" "Message" [tags]
 
 upall was written for one KDE neon desktop and keeps a few of its choices as constants near the top of each file:
 
-- `bin/upall`: `KERNEL_MB=120` (size of one kernel + initramfs in `/boot`), `SNAP_KEEP=3` (Timeshift),
+- `bin/upall`: `KERNEL_MB=120` (size of one kernel + initramfs in `/boot`), `SNAP_KEEP=2` (Timeshift),
   `TOOLS_KEEP=3` and `TOOLS_MAX_DAYS=14` (`/home` snapshots).
 - `lib/upall/secwatch.py`: `LOGIN_DELAY` (45 s; the network comes up ~30 s after login here), `RESUME_DELAY`,
   `MIN_INTERVAL`, `RENOTIFY`. Push titles start with the short host name.

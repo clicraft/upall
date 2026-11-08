@@ -36,8 +36,8 @@ tests without running anything.
    installed package that `is_auto_removable`); they count as apt work, so a run that only auto-removes still
    gets a snapshot.
 5. **pre_apt_snapshot**: `upall-root ts-create` (Timeshift `--create --comments upall-pre-apt --scripted`), then
-   `upall-root ts-prune 3`: from `timeshift --list --scripted`, rows whose comment is *exactly* `upall-pre-apt`
-   (the tag letters are skipped), oldest first, all but the newest 3.
+   `upall-root ts-prune 2`: from `timeshift --list --scripted`, rows whose comment is *exactly* `upall-pre-apt`
+   (the tag letters are skipped), oldest first, all but the newest 2.
 6. **parallel group**: nala ‖ flatpak ‖ snap, each to `$RUN/<name>.log`, exit code and duration to
    `$RUN/<name>.rc`. `wait_group` polls the `.rc` files so each job is reported the moment it ends.
 7. **topgrade** `--yes` (skipped by `--system`), after `upall-root home-snapshot` (read-only snapshot of `/home`,
