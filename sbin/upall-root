@@ -26,6 +26,7 @@ set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C.UTF-8
+unset APT_CONFIG   # `plan` also runs as the user: the same apt config as under sudo, so the hashes compare
 
 VERSION=2
 TS_TAG=upall-pre-apt
