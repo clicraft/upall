@@ -458,6 +458,7 @@ fw_and_summary() {
         if ((RESULT[$name] == 0)); then printf '%s✔%s %s\n' "$G" "$N" "$name"
         else printf '%s✘%s %s (exit %s)\n' "$R" "$N" "$name" "${RESULT[$name]}"; bad=1; fi
     done
+    ((${#RESULT[@]} || APT_SKIP)) || say "${G}✔${N} nothing to install"
     [[ -f /var/run/reboot-required ]] && say "${Y}Reboot required${N} ($(paste -sd' ' /var/run/reboot-required.pkgs 2>/dev/null))"
     return $bad
 }
