@@ -344,11 +344,16 @@ pre_tools_snapshot() {
 
 pk_refresh() {  # PackageKit cache refresh: Discover and its tray notifier rebuild their update lists
     have python3 && [[ -f $PK ]] || return 0
-    if spin "Refreshing Discover's package cache (PackageKit)…" "$RUN/packagekit.log" python3 -I "$PK"; then
-        say "${G}✔${N} Discover / PackageKit refreshed ${D}in $(fmt_t "$SPIN_T")${N}"
-    else
-        say "${Y}! PackageKit refresh failed ($(tail -n 1 "$RUN/packagekit.log")); press 'Actualitza la llista' in Discover${N}"
-    fi
+    local rc=0 why
+    spin "Refreshing Discover's package cache (PackageKit)…" "$RUN/packagekit.log" python3 -I "$PK" || rc=$?
+    why=$(tail -n 1 "$RUN/packagekit.log" | cut -c1-200)
+    case $rc in
+        0) say "${G}✔${N} Discover / PackageKit refreshed ${D}in $(fmt_t "$SPIN_T")${N}" ;;
+        # A dead PPA/repo host: apt already skipped it, PackageKit fails the whole refresh. Retrying now won't help.
+        3) say "${Y}! Discover cache not fully refreshed: ${why#PackageKit refresh: }${N}"
+           say "  ${D}apt skipped them and the upgrade is unaffected; Discover's list may lack their updates until they are back (details: $RUN/packagekit.log)${N}" ;;
+        *) say "${Y}! ${why:-PackageKit refresh failed}; press 'Actualitza la llista' in Discover (details: $RUN/packagekit.log)${N}" ;;
+    esac
 }
 
 # ---------------------------------------------------------------- update mode

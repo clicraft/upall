@@ -119,6 +119,11 @@ the active user, so no password. Both calls must come from the **same** D-Bus co
 the connection that created it; `busctl` per call fails with "sender does not match"). PackageKit then emits
 `UpdatesChanged` and Discover and its tray notifier rebuild their lists.
 
+PackageKit fails the whole refresh when any one source is unreachable (a dead PPA host), while apt just skips it. The
+script prints the full error, then a one-line summary built from the failing repo URLs as its last line, and exits 3
+for "sources unreachable" (2 timeout, 1 other failure); `upall` shows that line and drops the "press Refresh" hint
+for exit 3, since retrying would fail the same way.
+
 ## secwatch
 
 - **Triggers**: login (`LOGIN_DELAY` after the service starts in `graphical-session.target`) and resume (logind

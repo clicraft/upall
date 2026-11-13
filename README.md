@@ -315,6 +315,7 @@ upall was written for one KDE neon desktop and keeps a few of its choices as con
 | apt failed: "the apt plan changed since it was checked" | The apt lists were refreshed between upall's check and the upgrade (Discover, secwatch, another terminal). Nothing was installed; run upall again. |
 | "upall-root is version 1, upall ships 2" | The installed helper is older: run `./install.sh` and the `sudo install` command it prints. Until then upall asks for your password and secwatch can't install. |
 | Discover still lists updates you installed | Discover was open before; press "Refresh" once. upall refreshes PackageKit at the end of each run. |
+| "Discover cache not fully refreshed: N sources unreachable on ppa.launchpadcontent.net" | A PPA or repo host is down. apt skips it and the upgrade is unaffected, but PackageKit fails its whole refresh. It clears by itself once the host is back; the full error is in `packagekit.log`. |
 | A topgrade step fails | Plain mode prints topgrade's output; in the TUI see `topgrade.log` in the run's log folder. Disable the step in `~/.config/topgrade.toml` if it keeps failing. |
 | No phone pushes | `secwatch.py --test-push`, then `journalctl --user -u upall-secwatch` ("NTFY_URL must be https://", "ntfy push failed"); check `~/.config/upall/ntfy.conf` and the topic in the app. |
 
