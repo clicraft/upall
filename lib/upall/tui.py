@@ -12,7 +12,7 @@ Package jobs run in their own process group, so Ctrl-C stops this view but not a
 
 Options: --run DIR (log dir), --no-tools, --after-apt snap,flatpak, --plan (print plan and exit), --demo
 """
-import argparse, http.client, json, os, re, signal, socket, subprocess, sys, threading, time
+import argparse, http.client, json, os, re, signal, socket, subprocess, sys, threading, time, warnings
 from dataclasses import dataclass, field
 
 from rich.console import Console, Group
@@ -352,7 +352,11 @@ def run_flatpak(job, rundir):
         t.connect("operation-done", on_done)
         t.connect("operation-error", on_error)
         try:
-            t.run(None)
+            # libflatpak 1.14 registers operation-done's `result` as an int while its GIR says flags: PyGObject then
+            # warns "g_value_get_flags: assertion ... failed" once per operation, over the live display. We don't read it.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=r"g_value_get_flags: assertion 'G_VALUE_HOLDS_FLAGS")
+                t.run(None)
         except Exception as e:
             errors.append(str(e))
             log.write(f"run failed: {e}\n")
