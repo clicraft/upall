@@ -2,7 +2,8 @@
 # upall: check or update every package source on this machine.
 #
 #   upall check        list what is outdated (read-only, no password, sources queried in parallel)
-#   upall              update: apt (nala) + Flatpak + Snap in parallel, then topgrade for the rest
+#   upall              update: apt (nala) + Flatpak + Snap in parallel, then topgrade for the rest (in parallel
+#                      lanes, see ~/.config/upall/tools-lanes.conf)
 #   upall --system     only the apt/Flatpak/Snap group
 #   upall --firmware   also apply firmware updates (fwupd) at the end
 #   upall --tui        same update, shown as a live table (speed, sizes, current package per source)
@@ -387,20 +388,34 @@ summary_line() {  # name -> one line from the log worth showing
         apt)     grep -E -o '(Upgrade|Install|Auto-Remove|Remove) +[0-9]+ Packages?|Nothing to do|All packages are up to date|[0-9]+ upgraded, [0-9]+ newly installed, [0-9]+ to remove|no security updates|plan changed' "$log" | paste -sd',' ;;
         flatpak) grep -q 'Nothing to do' "$log" && echo 'nothing to do' || echo "updated: $(grep -c '^Updating' "$log")" ;;
         snap)    tail -n 3 "$log" | paste -sd'; ' ;;
+        tools-*) local n; n=$(sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$log" | grep -a -c '^―― [0-9:]* - ')
+                 n=$((n > 0 ? n - 1 : 0))   # minus the Summary header
+                 echo "$n step$([[ $n == 1 ]] || echo s)" ;;
     esac
 }
 
+failed_steps_tail() {  # a topgrade log: the output of each step the Summary marks FAILED (20 lines each); else the tail
+    local plain out; plain=$(sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$1")
+    out=$(awk 'NR == FNR { if ($0 ~ /: FAILED$/) { n = $0; sub(/: FAILED$/, "", n); bad[tolower(n)] = 1 } next }
+               /^―― [0-9:]+ - / { h = $0; sub(/^―― [0-9:]+ - /, "", h); sub(/ ――$/, "", h)
+                                  show = (h != "Summary" && tolower(h) in bad); c = 0; if (show) print $0; next }
+               show && c++ < 20' <(printf '%s\n' "$plain") <(printf '%s\n' "$plain"))
+    [[ -n $out ]] || out=$(printf '%s\n' "$plain" | tail -n 12)
+    printf '%s\n' "$out" | sed 's/^/    /'
+}
+
 wait_group() {  # report each job as it finishes; a spinner line names the ones still running
-    local name rc t left=${#PIDS[@]} start=$SECONDS running
+    local name rc t left=${#PIDS[@]} start=$SECONDS running w=8
+    for name in "${!PIDS[@]}"; do ((${#name} > w)) && w=${#name}; done
     ((TTY)) && { spin_reset; tput civis 2>/dev/null; }
     while ((left > 0)); do
         for name in "${!PIDS[@]}"; do
             [[ -f $RUN/$name.rc && -z ${RESULT[$name]:-} ]] || continue
             read -r rc t <"$RUN/$name.rc"; RESULT[$name]=$rc; left=$((left - 1))
             spin_clear
-            if ((rc == 0)); then printf '%s✔ %-8s%s done in %s  %s%s%s\n' "$G" "$name" "$N" "$(fmt_t "$t")" "$D" "$(summary_line "$name")" "$N"
-            else printf '%s✘ %-8s%s failed (exit %s) after %s. Last lines of %s:\n' "$R" "$name" "$N" "$rc" "$(fmt_t "$t")" "$RUN/$name.log"
-                 tail -n 12 "$RUN/$name.log" | sed 's/^/    /'; fi
+            if ((rc == 0)); then printf '%s✔ %-*s%s done in %s  %s%s%s\n' "$G" "$w" "$name" "$N" "$(fmt_t "$t")" "$D" "$(summary_line "$name")" "$N"
+            else printf '%s✘ %-*s%s failed (exit %s) after %s. Last lines of %s:\n' "$R" "$w" "$name" "$N" "$rc" "$(fmt_t "$t")" "$RUN/$name.log"
+                 if [[ $name == tools-* ]]; then failed_steps_tail "$RUN/$name.log"; else tail -n 12 "$RUN/$name.log" | sed 's/^/    /'; fi; fi
         done
         ((left > 0)) || break
         if ((TTY)); then
@@ -412,6 +427,33 @@ wait_group() {  # report each job as it finishes; a spinner line names the ones 
         fi
     done
     spin_clear; ((TTY)) && tput cnorm 2>/dev/null
+}
+
+# topgrade: in parallel lanes when ~/.config/upall/tools-lanes.conf is valid (tools_lanes.py checks it against
+# `topgrade -n`), otherwise one step after another with live output, as before lanes existed.
+run_tools() {
+    local line lane f rc worst=0 LANES=()
+    if have python3 && [[ -f $LANES_PY ]]; then
+        mapfile -t LANES < <(python3 -I "$LANES_PY" 2>"$RUN/tools-lanes.err")
+        [[ -s $RUN/tools-lanes.err ]] && say "${Y}! $(head -n 1 "$RUN/tools-lanes.err")${N}"
+    fi
+    if ((${#LANES[@]} == 0)); then
+        head_ "topgrade (user-level tools, one after another)"
+        topgrade --yes; RESULT[topgrade]=$?; return
+    fi
+    head_ "topgrade in ${#LANES[@]} parallel lanes ${D}(logs: $RUN/tools-<lane>.log)${N}"
+    PIDS=()
+    for line in "${LANES[@]}"; do
+        IFS=$'\t' read -ra f <<<"$line"
+        # setsid: no controlling terminal, so SDKMAN's `bash -i` can't grab it (same reason as in the TUI)
+        run_job "tools-${f[0]}" setsid -w topgrade --yes "${f[@]:1}"
+    done
+    wait_group
+    for line in "${LANES[@]}"; do
+        lane=${line%%$'\t'*}; rc=${RESULT[tools-$lane]:-1}
+        ((rc != 0)) && worst=$rc
+    done
+    RESULT[topgrade]=$worst
 }
 
 do_update() {
@@ -489,11 +531,11 @@ do_update() {
     fi
 
     if [[ $with_topgrade == 1 ]]; then
-        head_ "topgrade (user-level tools, one after another)"
         if have topgrade; then
             pre_tools_snapshot
-            topgrade --yes; RESULT[topgrade]=$?
+            run_tools
         else
+            head_ "topgrade"
             say "${Y}topgrade not installed: uv tool install topgrade${N}"; RESULT[topgrade]=127
         fi
     fi
@@ -532,6 +574,7 @@ fw_and_summary() {
 # ---------------------------------------------------------------- main
 TUI="$HOME/.local/lib/upall/tui.py"
 PK="$HOME/.local/lib/upall/pk_refresh.py"
+LANES_PY="$HOME/.local/lib/upall/tools_lanes.py"
 topgrade_on=1 fw=0 mode=update tui=0 demo=0 ask=0
 # Sourced (tests): load the functions only.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0

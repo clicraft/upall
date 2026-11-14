@@ -9,6 +9,7 @@ How upall works inside, the choices behind it, and the traps found while buildin
 bin/upall                 bash: modes, checks, safety, parallel jobs, spinner, summary
 lib/upall/tui.py          Python + rich: the --tui live view; runs the same jobs with finer progress
 lib/upall/pk_refresh.py   Python + gi: one PackageKit RefreshCache over D-Bus
+lib/upall/tools_lanes.py  Python (stdlib): splits topgrade into parallel lanes from tools-lanes.conf, checked with `topgrade -n`
 lib/upall/secwatch.py     Python + gi: user service, login/resume checks, dpkg.log watcher, ntfy pushes
 systemd/                  the user unit for secwatch
 sbin/upall-root           bash, root-owned when installed: the only commands upall runs as root, and the apt plans
@@ -43,6 +44,14 @@ tests without running anything.
    `$RUN/<name>.rc`. `wait_group` polls the `.rc` files so each job is reported the moment it ends.
 7. **topgrade** `--yes` (skipped by `--system`), after `upall-root home-snapshot` (read-only snapshot of `/home`,
    which Timeshift doesn't cover) and `upall-root home-prune 2 14`.
+   With `~/.config/upall/tools-lanes.conf`, topgrade runs as parallel lanes (`topgrade --yes --only …` per lane, plus a
+   `rest` lane with `--disable <the others>` so no step is dropped); without it, one step after another. topgrade
+   has no parallel mode: the steps are independent processes, so the lanes are separate topgrade runs, each in
+   its own session (SDKMAN's `bash -i`, see below). `tools_lanes.py` dry-runs every lane and the whole plan with
+   `topgrade -n` and refuses the config unless the lanes cover the plan exactly once: `--only` ignores the
+   `disable` list of `topgrade.toml`, so a lane naming a disabled step, a typo, a step in two lanes or a custom
+   command left between lanes would run too much, too little or twice. On any problem it prints why on stderr and
+   upall falls back to the sequential run. Steps sharing one package manager belong in one lane.
 8. **firmware** check (`fwupdmgr get-updates --json`, using the metadata `fwupd-refresh.timer` already fetched),
    **PackageKit refresh**, **summary** with per-source exit codes and "Reboot required" if
    `/var/run/reboot-required` exists.
@@ -87,7 +96,7 @@ Each source reports through the most precise channel it has:
 | apt | `apt-get --print-uris -qq full-upgrade` gives the .deb files and sizes nala will fetch. Progress = planned files already in `/var/cache/apt/archives` + sizes in `archives/partial` (root/_apt only: `upall-root apt-partial`, once a second). Then `Setting up` lines in the log for the install phase. |
 | snap | `upall-root snap-refresh --no-wait` prints a change id; per-task byte progress from the snapd REST API on `/run/snapd.socket` (`/v2/changes/{id}`), readable as the user. |
 | flatpak | runs in-process with libflatpak (`gi.repository.Flatpak` Transaction: `new-operation`, progress `changed`, `operation-done`/`operation-error`). Falls back to the `flatpak` CLI without byte progress if the bindings are missing. |
-| tools | topgrade's log: step headers (`―― HH:MM:SS - Step ――`) counted against a `topgrade -n` dry run. |
+| tools | the lane logs' step headers (`―― HH:MM:SS - Step ――`) counted against a `topgrade -n` dry run; each running lane's newest header is still in progress. |
 
 The look follows nala's own progress bar: red track filled in cyan, `•` separators, a dots spinner that turns
 into a green ✔. Layout by width, re-measured every frame:

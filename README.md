@@ -5,7 +5,7 @@
 
 One command to check and update every package source on an Ubuntu-based desktop (built on KDE neon 24.04):
 **apt** (through nala), **Flatpak** and **Snap** in parallel, then **topgrade** for user-level tools (rustup,
-pipx, uv tools, npm globals, VS Code extensions, gh extensions…). Firmware updates are checked and only applied
+pipx, uv tools, npm globals, VS Code extensions, gh extensions…), in parallel lanes you can configure. Firmware updates are checked and only applied
 when you ask for them.
 
 It comes with **upall-secwatch**, a small user service that checks for Ubuntu **security** updates after you log
@@ -282,9 +282,11 @@ python3 ~/.local/lib/upall/secwatch.py --push "Title" "Message" [tags]
 | `~/.local/lib/upall/secwatch.py` | security-alert service |
 | `~/.config/systemd/user/upall-secwatch.service` | its unit |
 | `~/.config/topgrade.toml` | which topgrade steps run ([example](examples/topgrade.toml)) |
+| `~/.config/upall/tools-lanes.conf` | which topgrade steps run side by side, one lane per line ([example](examples/tools-lanes.conf)); no file = one step after another |
+| `~/.local/lib/upall/tools_lanes.py` | builds and checks the lanes |
 | `~/.config/upall/ntfy.conf` | phone push topic, optional token and `NTFY_DETAILS` (secret, mode 600) |
 | `~/.config/upall/secwatch.conf` | `AUTO_APPLY` |
-| `~/.local/state/upall/<date-time>/` | one run: `apt.log`, `flatpak.log`, `snap.log`, `apt-update.log`, `snapshot.log`, `packagekit.log`, and `topgrade.log` in TUI mode |
+| `~/.local/state/upall/<date-time>/` | one run: `apt.log`, `flatpak.log`, `snap.log`, `apt-update.log`, `snapshot.log`, `packagekit.log`, `topgrade-<lane>.log` (one per lane; `topgrade.log` in TUI mode without lanes) |
 | `~/.local/state/upall/secwatch-upall-*.log` | unattended runs started by secwatch |
 | `~/.local/state/upall/secwatch.json` | secwatch state: last check, last notified set, dpkg.log offset |
 | `~/.local/lib/upall/upall-root` | copy of the root helper, used with your password when the root-owned one isn't installed |
@@ -316,7 +318,8 @@ upall was written for one KDE neon desktop and keeps a few of its choices as con
 | "upall-root is version 1, upall ships 2" | The installed helper is older: run `./install.sh` and the `sudo install` command it prints. Until then upall asks for your password and secwatch can't install. |
 | Discover still lists updates you installed | Discover was open before; press "Refresh" once. upall refreshes PackageKit at the end of each run. |
 | "Discover cache not fully refreshed: N sources unreachable on ppa.launchpadcontent.net" | A PPA or repo host is down. apt skips it and the upgrade is unaffected, but PackageKit fails its whole refresh. It clears by itself once the host is back; the full error is in `packagekit.log`. |
-| A topgrade step fails | Plain mode prints topgrade's output; in the TUI see `topgrade.log` in the run's log folder. Disable the step in `~/.config/topgrade.toml` if it keeps failing. |
+| "tools lanes ignored (…)" | `tools-lanes.conf` doesn't cover topgrade's plan exactly once (typo, a step in two lanes, a step `topgrade.toml` disables), so topgrade ran one step after another. The message names the step; fix the file. |
+| A topgrade step fails | With lanes, the failed lane's log is shown (`topgrade-<lane>.log`); without, plain mode prints topgrade's output and the TUI has `topgrade.log` in the run's log folder. Disable the step in `~/.config/topgrade.toml` if it keeps failing. |
 | No phone pushes | `secwatch.py --test-push`, then `journalctl --user -u upall-secwatch` ("NTFY_URL must be https://", "ntfy push failed"); check `~/.config/upall/ntfy.conf` and the topic in the app. |
 
 ## Uninstall

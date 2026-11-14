@@ -7,7 +7,8 @@ most precise channel it has:
            plus the size of archives/partial (read through `upall-root apt-partial`, once a second), then dpkg lines in the log
   snap     starts `snap refresh --no-wait`, then reads per-task byte progress from the snapd REST API
   flatpak  runs the update in-process with libflatpak (gi), which reports bytes and status per operation
-  tools    runs topgrade after the group; progress = steps seen / steps in a dry run
+  tools    runs topgrade after the group, in parallel lanes if ~/.config/upall/tools-lanes.conf says so
+           (tools_lanes.py); progress = steps seen in the lane logs / steps in a dry run
 Package jobs run in their own process group, so Ctrl-C stops this view but not apt/dpkg or snapd.
 
 Options: --run DIR (log dir), --no-tools, --after-apt snap,flatpak, --plan (print plan and exit), --demo
@@ -71,6 +72,7 @@ class Job:
     items_done: int = 0
     current: str = ""
     note: str = ""
+    log: str = ""                  # the log to tail when it fails (default: <name>.log)
     speed: float = 0.0              # bytes/s, smoothed
     started: float = 0.0
     ended: float = 0.0
@@ -387,27 +389,85 @@ def topgrade_steps():
     return [s for s in TG_STEP.findall(re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", out)) if s != "Summary"]
 
 
-def run_tools(job, rundir, planned):
-    with open(f"{rundir}/topgrade.log", "w") as log:
-        p = popen(["topgrade", "--yes"], log, detach_tty=True)
+def tools_lanes():
+    """[(lane, topgrade args)] from tools_lanes.py (~/.config/upall/tools-lanes.conf), or [] for one sequential
+    `topgrade --yes`. The helper dry-runs the lanes first; why it ignored a config goes to the events."""
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools_lanes.py")
+    if not os.path.exists(helper):
+        return []
+    try:
+        r = subprocess.run([sys.executable, "-I", helper], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           env=ENV_C, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.stderr.strip():
+        event("tools: " + r.stderr.strip().splitlines()[0][:150])
+    return [(f[0], f[1:]) for f in (l.split("\t") for l in r.stdout.splitlines() if l)]
+
+
+def failed_sections(text, cap=20):
+    """Output of each step the topgrade Summary marks FAILED (header line + up to `cap` lines); [] if none matched."""
+    text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", text)
+    bad = {m.lower() for m in re.findall(r"^(.+?): FAILED", text, re.M)}
+    out, show, n = [], False, 0
+    for line in text.splitlines():
+        m = TG_STEP.match(line)
+        if m:
+            show, n = m.group(1) != "Summary" and m.group(1).lower() in bad, 0
+            if show:
+                out.append(line)
+        elif show and n < cap:
+            out.append(line); n += 1
+    return out
+
+
+def run_tools(job, rundir, planned, lanes=None):
+    """topgrade, in parallel lanes (see tools_lanes.py) or as one run. Progress = step headers seen in all the lane
+    logs, against the steps of the dry run; each running lane's newest header is still in progress."""
+    single = not lanes
+    lanes = lanes or [("", [])]
+    procs = {}
+    for name, args in lanes:
+        path = f"{rundir}/topgrade{'-' + name if name else ''}.log"
+        with open(path, "w") as log:
+            procs[name] = (popen(["topgrade", "--yes", *args], log, detach_tty=True), path)
     job.start("running")
     job.items_total = len(planned) or 1
-    seen = []
-    while p.poll() is None:
-        text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", open(f"{rundir}/topgrade.log", errors="replace").read())
-        steps = [s for s in TG_STEP.findall(text) if s != "Summary"]
-        for s in steps[len(seen):]:
-            seen.append(s)
-            event(f"tools: {s}")
-        job.items_total = max(len(planned), len(seen) + 1)
-        job.items_done = max(0, len(seen) - 1)
-        job.current = seen[-1] if seen else "starting"
+    seen = {n: [] for n in procs}
+
+    def read(path):
+        return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", open(path, errors="replace").read())
+
+    def poll():
+        cur, running = [], 0
+        for n, (p, path) in procs.items():
+            steps = [s for s in TG_STEP.findall(read(path)) if s != "Summary"]
+            for s in steps[len(seen[n]):]:
+                seen[n].append(s)
+                event(f"tools: {s}" if single else f"tools: {n}: {s}")
+            if p.poll() is None and steps:
+                running += 1
+                cur.append(steps[-1] if single else f"{n}: {steps[-1]}")
+        total = sum(len(v) for v in seen.values())
+        job.items_total = max(len(planned), total + running)
+        job.items_done = max(0, total - running)
+        job.current = "  ·  ".join(cur) or "starting"
+
+    while any(p.poll() is None for p, _ in procs.values()):
+        poll()
         time.sleep(0.5)
-    text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", open(f"{rundir}/topgrade.log", errors="replace").read())
-    failed = re.findall(r"^(.+?): FAILED", text, re.M)
-    job.items_done, job.current = job.items_total, ""
-    rc = p.wait()
-    job.finish(rc if not failed else (rc or 1), ("failed: " + ", ".join(failed)) if failed else f"{len(seen)} steps")
+    poll()
+    rc, failed, bad_log = 0, [], ""
+    for n, (p, path) in procs.items():
+        lane_rc = p.wait()
+        lane_failed = re.findall(r"^(.+?): FAILED", read(path), re.M)
+        failed += [f"{n}: {f}" if not single else f for f in lane_failed]
+        if (lane_rc or lane_failed) and not bad_log:
+            bad_log = path
+        rc = rc or lane_rc or (1 if lane_failed else 0)
+    job.items_done, job.current, job.log = job.items_total, "", bad_log
+    job.finish(rc, ("failed: " + ", ".join(failed)) if failed else
+               f"{sum(len(v) for v in seen.values())} steps" + ("" if single else f", {len(procs)} lanes"))
     event(f"tools: {'done' if job.rc == 0 else job.note}")
 
 
@@ -634,13 +694,14 @@ def main():
         except Exception as e:
             print(f"flatpak: bindings unavailable: {e}")
         print(f"tools:   {topgrade_steps()}")
+        print(f"lanes:   {[n for n, _ in tools_lanes()] or 'none (one topgrade, step after step)'}")
         return 0
 
     jobs = {n: Job(n) for n in ("apt", "flatpak", "snap", "tools")}
     if a.no_tools:
         del jobs["tools"]
     after = set(filter(None, a.after_apt.split(",")))
-    planned_tools = []
+    planned_tools, lanes = [], []
 
     if a.demo:
         runners = {"apt": lambda j, d: run_demo(j, d, 180e6, 42, 14e6),
@@ -662,17 +723,20 @@ def main():
             event(f"{name}: internal error {e}")
 
     def tools_plan():
-        nonlocal planned_tools
+        nonlocal planned_tools, lanes
         try:
             planned_tools = topgrade_steps() if not a.demo else ["rustup", "pipx", "npm", "uv tools"]
+            lanes = tools_lanes() if not a.demo else []
         except Exception:
             planned_tools = []
         if "tools" in jobs:
             jobs["tools"].items_total = len(planned_tools)
-            jobs["tools"].current = f"after the package group ({len(planned_tools)} steps)"
+            jobs["tools"].current = (f"after the package group ({len(planned_tools)} steps"
+                                     + (f", {len(lanes)} parallel lanes)" if lanes else ")"))
 
     def orchestrate():
-        threading.Thread(target=tools_plan, daemon=True).start()
+        plan_th = threading.Thread(target=tools_plan, daemon=True)
+        plan_th.start()
         first = [n for n in ("apt", "flatpak", "snap") if n not in after]
         ths = [threading.Thread(target=worker, args=(n,), daemon=True) for n in first]
         for n in after:
@@ -690,7 +754,8 @@ def main():
                 run_demo(jobs["tools"], rundir, 0, 4, 0)
             else:
                 try:
-                    run_tools(jobs["tools"], rundir, planned_tools)
+                    plan_th.join(300)
+                    run_tools(jobs["tools"], rundir, planned_tools, lanes)
                 except Exception as e:
                     jobs["tools"].finish(1, f"internal error: {e}"[:70])
 
@@ -711,10 +776,11 @@ def main():
         return 130
     bad = [j for j in jobs.values() if j.state == "failed"]
     for j in bad:
-        log = f"{rundir}/{'topgrade' if j.name == 'tools' else j.name}.log"
+        log = j.log or f"{rundir}/{'topgrade' if j.name == 'tools' else j.name}.log"
         console.print(f"[red]✘ {escape(j.name)}[/] {escape(j.note)}  [dim]{escape(log)}[/]")
         if os.path.exists(log):
-            tail = open(log, errors="replace").read().strip().splitlines()[-8:]
+            text = open(log, errors="replace").read()
+            tail = (failed_sections(text) if j.name == "tools" else []) or text.strip().splitlines()[-8:]
             console.print(Text("\n".join("    " + l for l in tail), style="dim"))
     return 1 if bad else 0
 

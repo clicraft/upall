@@ -17,6 +17,8 @@
 #   through a bin link; replaced by the custom command below with --ignore-scripts.
 disable = ["system", "snap", "flatpak", "firmware", "containers", "android_studio", "self_update", "node", "github_cli_skills", "vscode"]
 
+# upall can run these steps in parallel lanes: see tools-lanes.conf.
+
 # Don't stop to ask "retry?" when a step fails; upall shows the failures in the summary.
 no_retry = true
 notify_end = "never"

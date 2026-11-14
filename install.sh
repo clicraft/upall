@@ -37,11 +37,13 @@ put_once() {  # put_once MODE SRC DEST: copy only if DEST doesn't exist (user co
 put 0755 bin/upall                 "$BIN/upall"
 put 0644 lib/upall/tui.py          "$LIB/tui.py"
 put 0644 lib/upall/pk_refresh.py   "$LIB/pk_refresh.py"
+put 0644 lib/upall/tools_lanes.py  "$LIB/tools_lanes.py"
 put 0644 lib/upall/secwatch.py     "$LIB/secwatch.py"
 put 0755 sbin/upall-root           "$LIB/upall-root"     # used with your password until the root-owned copy exists
 put 0644 systemd/upall-secwatch.service "$UNIT_DIR/upall-secwatch.service"
 put_once 0644 examples/topgrade.toml "${XDG_CONFIG_HOME:-$HOME/.config}/topgrade.toml"
 put_once 0644 examples/secwatch.conf "$CONF_DIR/secwatch.conf"
+put_once 0644 examples/tools-lanes.conf "$CONF_DIR/tools-lanes.conf"
 ((${#changed[@]})) || echo "upall files already up to date"
 
 # ntfy.conf holds a secret topic: never created from the placeholder, only explained.
