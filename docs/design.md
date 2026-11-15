@@ -52,6 +52,10 @@ tests without running anything.
    `disable` list of `topgrade.toml`, so a lane naming a disabled step, a typo, a step in two lanes or a custom
    command left between lanes would run too much, too little or twice. On any problem it prints why on stderr and
    upall falls back to the sequential run. Steps sharing one package manager belong in one lane.
+   A lane none of whose steps apply on this machine (tool not installed) is skipped with a note, and fewer than two
+   lanes means the sequential run. Nothing in the helper can stop the update: any error only costs the speed-up. A job
+   killed from outside never writes its `.rc`; `wait_group` notices the dead PID and reports it as exit 137 instead of
+   waiting forever. Lanes run in their own session, so closing the view or Ctrl-C leaves them to finish (like apt).
 8. **firmware** check (`fwupdmgr get-updates --json`, using the metadata `fwupd-refresh.timer` already fetched),
    **PackageKit refresh**, **summary** with per-source exit codes and "Reboot required" if
    `/var/run/reboot-required` exists.

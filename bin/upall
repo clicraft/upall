@@ -410,6 +410,9 @@ wait_group() {  # report each job as it finishes; a spinner line names the ones 
     ((TTY)) && { spin_reset; tput civis 2>/dev/null; }
     while ((left > 0)); do
         for name in "${!PIDS[@]}"; do
+            # a job killed from outside (kill -9, OOM) never writes its .rc: don't wait for it forever
+            [[ -f $RUN/$name.rc || -n ${RESULT[$name]:-} ]] || kill -0 "${PIDS[$name]}" 2>/dev/null \
+                || [[ -f $RUN/$name.rc ]] || echo "137 0" >"$RUN/$name.rc"
             [[ -f $RUN/$name.rc && -z ${RESULT[$name]:-} ]] || continue
             read -r rc t <"$RUN/$name.rc"; RESULT[$name]=$rc; left=$((left - 1))
             spin_clear
@@ -433,7 +436,7 @@ wait_group() {  # report each job as it finishes; a spinner line names the ones 
 # `topgrade -n`), otherwise one step after another with live output, as before lanes existed.
 run_tools() {
     local line lane f rc worst=0 LANES=()
-    if have python3 && [[ -f $LANES_PY ]]; then
+    if have python3 && have setsid && [[ -f $LANES_PY ]]; then
         mapfile -t LANES < <(python3 -I "$LANES_PY" 2>"$RUN/tools-lanes.err")
         [[ -s $RUN/tools-lanes.err ]] && say "${Y}! $(head -n 1 "$RUN/tools-lanes.err")${N}"
     fi

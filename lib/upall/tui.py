@@ -426,11 +426,18 @@ def run_tools(job, rundir, planned, lanes=None):
     logs, against the steps of the dry run; each running lane's newest header is still in progress."""
     single = not lanes
     lanes = lanes or [("", [])]
-    procs = {}
+    procs, start_errors = {}, []
     for name, args in lanes:
         path = f"{rundir}/topgrade{'-' + name if name else ''}.log"
-        with open(path, "w") as log:
-            procs[name] = (popen(["topgrade", "--yes", *args], log, detach_tty=True), path)
+        try:
+            with open(path, "w") as log:
+                procs[name] = (popen(["topgrade", "--yes", *args], log, detach_tty=True), path)
+        except OSError as e:   # one lane failing to start must not abandon the lanes already running
+            start_errors.append(f"{name or 'topgrade'}: {e}"[:70])
+    if not procs:
+        job.finish(1, start_errors[0] if start_errors else "topgrade did not start")
+        event(f"tools: {job.note}")
+        return
     job.start("running")
     job.items_total = len(planned) or 1
     seen = {n: [] for n in procs}
@@ -465,6 +472,9 @@ def run_tools(job, rundir, planned, lanes=None):
         if (lane_rc or lane_failed) and not bad_log:
             bad_log = path
         rc = rc or lane_rc or (1 if lane_failed else 0)
+    if start_errors:
+        rc = rc or 1
+        failed += start_errors
     job.items_done, job.current, job.log = job.items_total, "", bad_log
     job.finish(rc, ("failed: " + ", ".join(failed)) if failed else
                f"{sum(len(v) for v in seen.values())} steps" + ("" if single else f", {len(procs)} lanes"))
@@ -772,7 +782,7 @@ def main():
             live.update(render(jobs.values(), t0, rundir, size=console.size, footer=f"logs: {rundir}"))
     except KeyboardInterrupt:
         console.print(f"\n[yellow]View closed. apt/dpkg and snapd keep running in the background "
-                      f"(flatpak stops where it was; that is safe). Logs: {escape(rundir)}[/]")
+                      f"(flatpak stops where it was; that is safe; topgrade lanes finish on their own). Logs: {escape(rundir)}[/]")
         return 130
     bad = [j for j in jobs.values() if j.state == "failed"]
     for j in bad:

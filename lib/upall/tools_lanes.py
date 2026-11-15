@@ -46,7 +46,7 @@ def parse(text):
         for it in (i.strip() for i in items.split(",")):
             if it.startswith("cmd:"):
                 c = it[4:].strip()
-                if not c or "\t" in c or "\x00" in c:
+                if not c or c.startswith("-") or any(ord(ch) < 32 for ch in c):
                     raise ValueError(f"line {n}: empty or invalid custom command name")
                 cmds.append(c)
             elif STEP_NAME.match(it):
@@ -85,23 +85,31 @@ def build(lanes, custom_all):
 def dry(args):
     r = subprocess.run(["topgrade", "-n", "--no-self-update", *args], stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, env=ENV_C, timeout=120)
+    if r.returncode != 0:   # e.g. clap rejecting an unknown step name, or a broken topgrade.toml
+        err = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", r.stderr).strip().splitlines()
+        raise ValueError("topgrade -n " + " ".join(args) + " failed: " + (err[0] if err else f"exit {r.returncode}"))
     text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", r.stdout)
     return [s for s in STEP_HDR.findall(text) if s != "Summary"]
 
 
-def plan(text, dry=dry):
-    """[(lane, args)] to run in parallel; raises ValueError when the lanes don't cover the plan exactly once."""
+def plan(text, dry=dry, notes=None):
+    """[(lane, args)] to run in parallel; raises ValueError when the lanes don't cover the plan exactly once.
+    A lane whose steps topgrade doesn't offer on this machine (tool not installed) is skipped; `notes` gets a line."""
     lanes = parse(text)
     if not lanes:
         return []
     full = dry([])
     lane_args_ = build(lanes, dry(["--only", "custom_commands"]))
-    got = Counter()
+    got, kept = Counter(), []
     for name, args in lane_args_:
         steps = dry(args)
         if not steps and name != "rest":
-            raise ValueError(f"lane '{name}' runs nothing: check its step names (topgrade --help)")
+            if notes is not None:
+                notes.append(f"lane '{name}' skipped: none of its steps apply on this machine")
+            continue
         got.update(steps)
+        kept.append((name, args))
+    lane_args_ = kept
     want = Counter(full)
     problems = []
     if want - got:
@@ -118,17 +126,23 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     try:
-        text = open(CONF).read()
+        text = open(CONF, encoding="utf-8").read()
     except FileNotFoundError:
         return 0
-    except OSError as e:
-        print(f"tools lanes: cannot read {CONF}: {e}", file=sys.stderr)
+    except (OSError, UnicodeError) as e:
+        print(f"tools lanes ignored (cannot read {CONF}: {e}); running topgrade one step after another",
+              file=sys.stderr)
         return 0
+    notes = []
     try:
-        lanes = plan(text)
-    except (ValueError, subprocess.SubprocessError, OSError) as e:
+        lanes = plan(text, notes=notes)
+    except Exception as e:   # whatever goes wrong here must only cost the speed-up, never the update
         print(f"tools lanes ignored ({e}); running topgrade one step after another. Config: {CONF}", file=sys.stderr)
         return 0
+    if notes:
+        print("tools lanes: " + "; ".join(notes), file=sys.stderr)
+    if len(lanes) < 2:
+        return 0   # nothing to run side by side
     for name, args in lanes:
         print("\t".join([name, *args]))
     return 0
@@ -185,11 +199,16 @@ def selftest():
         return out
     ok = plan("l1: a, cmd:c1\n", fake)
     assert [n for n, _ in ok] == ["l1", "rest"], ok
-    for bad, why in (("l1: a\nl2: a\n", "twice"), ("l1: zzz\n", "runs nothing")):
-        try:
-            plan(bad, fake); raise SystemExit(f"selftest: accepted {bad!r}")
-        except ValueError as e:
-            assert why in str(e), (bad, e)
+    try:
+        plan("l1: a\nl2: a\n", fake); raise SystemExit("selftest: accepted a step in two lanes")
+    except ValueError as e:
+        assert "twice" in str(e), e
+    notes = []
+    assert [n for n, _ in plan("l1: a\nl2: zzz\n", fake, notes)] == ["l1", "rest"] and "l2" in notes[0], notes
+    try:
+        parse("a: cmd:-x"); raise SystemExit("selftest: accepted cmd:-x")
+    except ValueError:
+        pass
     assert plan("", fake) == []
     print("selftest: ok")
     return 0

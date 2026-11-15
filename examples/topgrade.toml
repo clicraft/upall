@@ -13,9 +13,10 @@
 #   deprecation warnings off (VS Code's own CLI prints a DEP0169 url.parse() warning on every run).
 # - github_cli_skills: `gh skill update` only manages skills installed with `gh skill install`; skills
 #   installed by their own tool (graphify) or written by hand only produce "no GitHub metadata" notices.
+# - pipx: replaced by the custom command below, which upgrades the venvs in parallel.
 # - node: `npm update -g` fails because ~/.npmrc has bin-links=false and yo's postinstall runs `yodoctor`
 #   through a bin link; replaced by the custom command below with --ignore-scripts.
-disable = ["system", "snap", "flatpak", "firmware", "containers", "android_studio", "self_update", "node", "github_cli_skills", "vscode"]
+disable = ["system", "snap", "flatpak", "firmware", "containers", "android_studio", "self_update", "node", "github_cli_skills", "vscode", "pipx"]
 
 # upall can run these steps in parallel lanes: see tools-lanes.conf.
 
@@ -32,3 +33,6 @@ notify_end = "never"
 "npm globals" = "npm outdated -g >/dev/null 2>&1 && exit 0; npm update -g --ignore-scripts --loglevel=error --no-fund"
 # VS Code extensions, as topgrade's own step, without the DEP0169 warning from VS Code's CLI (see [misc] disable).
 "Visual Studio Code extensions" = "command -v code >/dev/null || exit 0; NODE_OPTIONS=--no-deprecation code --update-extensions"
+# pipx packages, one venv per package: `pipx upgrade-all` walks them one after another (~9 s for 6 venvs of which
+# one is big), the venvs are independent, so they upgrade side by side (~4 s).
+"pipx packages" = "command -v pipx >/dev/null || exit 0; pipx list --short | awk '{print $1}' | xargs -r -P6 -n1 pipx upgrade --include-injected"
