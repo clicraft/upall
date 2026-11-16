@@ -1,0 +1,23 @@
+[Unit]
+Description=upall: refresh snaps at boot, before any app holds them (like Discover's offline updates)
+Documentation=https://github.com/clicraft/upall#boot-time-snap-refresh
+# snapd refuses to replace a snap while one of its apps runs ("cannot refresh (node) due running apps").
+# Right after boot nothing is running yet, so the refresh goes through.
+After=snapd.seeded.service network-online.target
+Wants=network-online.target
+Requires=snapd.seeded.service
+# Not Before=display-manager: a slow download must never hold the login screen.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/upall-root snap-refresh
+TimeoutStartSec=15min
+# The network can come up late (about 30 s after login on this PC): try again a few times.
+Restart=on-failure
+RestartSec=45
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

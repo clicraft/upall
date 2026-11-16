@@ -272,6 +272,15 @@ python3 ~/.local/lib/upall/secwatch.py --scan-dpkg  # report security updates dp
 python3 ~/.local/lib/upall/secwatch.py --push "Title" "Message" [tags]
 ```
 
+## Boot-time snap refresh
+
+snapd will not replace a snap while one of its apps is running (`cannot refresh (node) due running apps`).
+Editors, MCP servers and other tools keep the `node` snap busy all day, so its update can wait for days. The
+root unit `systemd/upall-boot-refresh.service` runs `upall-root snap-refresh` once per boot, after snapd and the
+network are up and before you start any app, so those updates go through on the next restart (the same idea
+as Discover's offline updates). It never holds the login screen, and retries a few times if the network is late.
+`install.sh` prints the one `sudo` command that installs and enables it. Log: `journalctl -u upall-boot-refresh`.
+
 ## Files, logs and state
 
 | Path | What |

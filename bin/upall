@@ -459,8 +459,33 @@ run_tools() {
     RESULT[topgrade]=$worst
 }
 
+# Internet check: DNS plus an HTTPS connection to the Ubuntu archive. Without it every source fails with
+# long, confusing messages (flatpak prints one "No such ref" warning per installed ref), so stop early.
+# A few tries: the network comes up a while after login or resume.
+online() {
+    local i
+    for i in 1 2 3; do
+        timeout 4 bash -c 'getent hosts archive.ubuntu.com >/dev/null && exec 3<>/dev/tcp/archive.ubuntu.com/443' 2>/dev/null && return 0
+        ((i < 3)) && sleep 2
+    done
+    return 1
+}
+
+# One update at a time. The lock lives on a file descriptor that the jobs inherit, so it is released when the
+# last of them ends: after Ctrl-C (jobs are left to finish) a new upall waits for them instead of colliding.
+lock_or_exit() {
+    mkdir -p "$LOGROOT"
+    exec 9>"$LOGROOT/upall.lock"
+    flock -n 9 || { say "${Y}Another upall is already running (or finishing its jobs): nothing started.${N}"; exit 1; }
+}
+
 do_update() {
     local with_topgrade=$1 with_fw=$2 tui=$3 ask=$4
+    lock_or_exit
+    if ! online; then
+        say "${R}✘ No internet access${N} ${D}(nothing was updated; check the connection and run upall again)${N}"
+        exit 1
+    fi
     RUN="$LOGROOT/$(date +%Y%m%d-%H%M%S)"; mkdir -p "$RUN"
     declare -gA PIDS=() RESULT=()
 

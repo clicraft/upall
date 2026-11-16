@@ -91,6 +91,12 @@ cmp -s "$helper" /usr/local/sbin/upall-root ||
 # /etc/sudoers.d is root-only, so test what matters: does the helper already run without a password?
 sudo -n /usr/local/sbin/upall-root ping >/dev/null 2>&1 ||
     root_cmds+=("sudo visudo -c -f $rule && sudo install -m 0440 -o root -g root $rule /etc/sudoers.d/upall-nopasswd")
+# Boot-time snap refresh: a root unit running the helper's snap-refresh once per boot, before apps hold the snaps.
+unit=$PWD/systemd/upall-boot-refresh.service
+if ! cmp -s "$unit" /etc/systemd/system/upall-boot-refresh.service \
+   || ! systemctl is-enabled -q upall-boot-refresh.service 2>/dev/null; then
+    root_cmds+=("sudo install -m 0644 -o root -g root $unit /etc/systemd/system/upall-boot-refresh.service && sudo systemctl daemon-reload && sudo systemctl enable upall-boot-refresh.service")
+fi
 if ((${#root_cmds[@]})); then
     echo
     echo "Root helper and passwordless rule for unattended runs (read them first: $helper, $rule):"
