@@ -28,12 +28,15 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C.UTF-8
 unset APT_CONFIG   # `plan` also runs as the user: the same apt config as under sudo, so the hashes compare
 
-VERSION=2
+VERSION=3
 TS_TAG=upall-pre-apt
 HOME_DIR=/home
 HSNAP_DIR=/home/.snapshots
 HTAG=upall-pre-tools
 APT_LOCK=(-o DPkg::Lock::Timeout=300)
+# Index refresh only: a slow or failing third-party repo (e.g. a CDN returning 502/504) must not hold the run for
+# minutes. Timeout = seconds without data per connection (apt's default is 120); one retry instead of three.
+APT_NET=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=1)
 CONF_OPTS=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 
 die() { local code=$1; shift; echo "upall-root: $*" >&2; exit "$code"; }
@@ -158,8 +161,8 @@ esac
 # 3. Act.
 case $verb in
     ping)         echo ok ;;
-    update)       exec apt-get update -q "${APT_LOCK[@]}" ;;
-    update-quiet) exec apt-get update -qq "${APT_LOCK[@]}" ;;
+    update)       exec apt-get update -q "${APT_LOCK[@]}" "${APT_NET[@]}" ;;
+    update-quiet) exec apt-get update -qq "${APT_LOCK[@]}" "${APT_NET[@]}" ;;
     upgrade)
         same_plan "$1" full
         export DEBIAN_FRONTEND=noninteractive
